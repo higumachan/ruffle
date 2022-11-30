@@ -2,7 +2,7 @@
 
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
-use crate::avm1::object::bevel_filter::BevelFilterType;
+use crate::avm1::globals::bevel_filter::BevelFilterType;
 use crate::avm1::object::gradient_bevel_filter::GradientBevelFilterObject;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{ArrayObject, Object, TObject, Value};
@@ -387,13 +387,13 @@ pub fn set_quality<'gc>(
 }
 
 pub fn get_type<'gc>(
-    activation: &mut Activation<'_, 'gc, '_>,
+    _activation: &mut Activation<'_, 'gc, '_>,
     this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(filter) = this.as_gradient_bevel_filter_object() {
         let type_: &WStr = filter.get_type().into();
-        return Ok(AvmString::new(activation.context.gc_context, type_).into());
+        return Ok(AvmString::from(type_).into());
     }
 
     Ok(Value::Undefined)
@@ -451,7 +451,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let color_matrix_filter = GradientBevelFilterObject::empty_object(gc_context, Some(proto));
+    let color_matrix_filter = GradientBevelFilterObject::empty_object(gc_context, proto);
     let object = color_matrix_filter.as_script_object().unwrap();
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
     color_matrix_filter.into()

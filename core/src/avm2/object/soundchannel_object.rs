@@ -13,7 +13,7 @@ use std::cell::{Ref, RefMut};
 pub fn soundchannel_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
+) -> Result<Object<'gc>, Error<'gc>> {
     let base = ScriptObjectData::new(class);
 
     Ok(SoundChannelObject(GcCell::allocate(
@@ -50,7 +50,7 @@ impl<'gc> SoundChannelObject<'gc> {
     pub fn from_sound_instance(
         activation: &mut Activation<'_, 'gc, '_>,
         sound: SoundInstanceHandle,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let class = activation.avm2().classes().soundchannel;
         let base = ScriptObjectData::new(class);
 
@@ -74,12 +74,12 @@ impl<'gc> SoundChannelObject<'gc> {
         self.0.read().sound
     }
 
-    /// Return the position of the playing sound in seconds.
+    /// Return the position of the playing sound in milliseconds.
     pub fn position(self) -> f64 {
         self.0.read().position
     }
 
-    /// Set the position of the playing sound in seconds.
+    /// Set the position of the playing sound in milliseconds.
     pub fn set_position(self, mc: MutationContext<'gc, '_>, value: f64) {
         self.0.write(mc).position = value;
     }
@@ -94,7 +94,7 @@ impl<'gc> TObject<'gc> for SoundChannelObject<'gc> {
         RefMut::map(self.0.write(mc), |write| &mut write.base)
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Object::from(*self).into())
     }
 

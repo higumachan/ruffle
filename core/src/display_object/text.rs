@@ -1,10 +1,15 @@
+use crate::avm2::{
+    Activation as Avm2Activation, Object as Avm2Object, StageObject as Avm2StageObject,
+};
 use crate::context::{RenderContext, UpdateContext};
 use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject};
 use crate::font::TextRenderSettings;
 use crate::prelude::*;
 use crate::tag_utils::SwfMovie;
-use crate::transform::Transform;
+use crate::vminterface::Instantiator;
 use gc_arena::{Collect, GcCell, MutationContext};
+use ruffle_render::commands::CommandHandler;
+use ruffle_render::transform::Transform;
 use std::cell::{Ref, RefMut};
 use std::sync::Arc;
 
@@ -18,6 +23,7 @@ pub struct TextData<'gc> {
     base: DisplayObjectBase<'gc>,
     static_data: gc_arena::Gc<'gc, TextStatic>,
     render_settings: TextRenderSettings,
+    avm2_object: Option<Avm2Object<'gc>>,
 }
 
 impl<'gc> Text<'gc> {
@@ -35,12 +41,13 @@ impl<'gc> Text<'gc> {
                     TextStatic {
                         swf,
                         id: tag.id,
-                        bounds: tag.bounds.clone().into(),
+                        bounds: (&tag.bounds).into(),
                         text_transform: tag.matrix.into(),
                         text_blocks: tag.records.clone(),
                     },
                 ),
                 render_settings: Default::default(),
+                avm2_object: None,
             },
         ))
     }
@@ -136,7 +143,7 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
                         context.transform_stack.push(&transform);
                         let glyph_shape_handle = glyph.shape_handle(context.renderer);
                         context
-                            .renderer
+                            .commands
                             .render_shape(glyph_shape_handle, context.transform_stack.transform());
                         context.transform_stack.pop();
                         transform.matrix.tx += Twips::new(c.advance);
@@ -201,7 +208,7 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
                             let glyph_shape = glyph.as_shape();
                             let glyph_bounds: BoundingBox = (&glyph_shape.shape_bounds).into();
                             if glyph_bounds.contains(point)
-                                && crate::shape_utils::shape_hit_test(
+                                && ruffle_render::shape_utils::shape_hit_test(
                                     &glyph_shape,
                                     point,
                                     &local_matrix,
@@ -218,6 +225,41 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
         }
 
         false
+    }
+
+    fn post_instantiation(
+        &self,
+        context: &mut UpdateContext<'_, 'gc, '_>,
+        _init_object: Option<crate::avm1::Object<'gc>>,
+        _instantiated_by: Instantiator,
+        _run_frame: bool,
+    ) {
+        if context.is_action_script_3() {
+            let mut activation = Avm2Activation::from_nothing(context.reborrow());
+            let statictext = activation.avm2().classes().statictext;
+            match Avm2StageObject::for_display_object_childless(
+                &mut activation,
+                (*self).into(),
+                statictext,
+            ) {
+                Ok(object) => {
+                    self.0.write(activation.context.gc_context).avm2_object = Some(object.into())
+                }
+                Err(e) => log::error!("Got error when creating AVM2 side of Text: {}", e),
+            }
+        }
+    }
+
+    fn object2(&self) -> Avm2Value<'gc> {
+        self.0
+            .read()
+            .avm2_object
+            .map(|o| o.into())
+            .unwrap_or(Avm2Value::Undefined)
+    }
+
+    fn set_object2(&mut self, mc: MutationContext<'gc, '_>, to: Avm2Object<'gc>) {
+        self.0.write(mc).avm2_object = Some(to);
     }
 }
 

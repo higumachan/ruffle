@@ -80,16 +80,16 @@ pub struct XmlObjectData<'gc> {
 
 impl<'gc> XmlObject<'gc> {
     /// Construct a new XML document and object pair.
-    pub fn empty(gc_context: MutationContext<'gc, '_>, proto: Option<Object<'gc>>) -> Self {
+    pub fn empty(gc_context: MutationContext<'gc, '_>, proto: Object<'gc>) -> Self {
         let mut root = XmlNode::new(gc_context, ELEMENT_NODE, None);
         let object = Self(GcCell::allocate(
             gc_context,
             XmlObjectData {
-                base: ScriptObject::object(gc_context, proto),
+                base: ScriptObject::new(gc_context, Some(proto)),
                 root,
                 xml_decl: None,
                 doctype: None,
-                id_map: ScriptObject::bare_object(gc_context),
+                id_map: ScriptObject::new(gc_context, None),
                 status: XmlStatus::NoError,
             },
         ));
@@ -172,7 +172,7 @@ impl<'gc> XmlObject<'gc> {
                     let is_whitespace_char = |c: &u8| matches!(*c, b'\t' | b'\n' | b'\r' | b' ');
                     let is_whitespace_text = text.iter().all(is_whitespace_char);
                     if !(text.is_empty() || ignore_white && is_whitespace_text) {
-                        let text = AvmString::new_utf8_bytes(activation.context.gc_context, text)?;
+                        let text = AvmString::new_utf8_bytes(activation.context.gc_context, &text);
                         let child =
                             XmlNode::new(activation.context.gc_context, TEXT_NODE, Some(text));
                         open_tags
@@ -235,7 +235,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         this: Object<'gc>,
     ) -> Result<Object<'gc>, Error<'gc>> {
-        Ok(Self::empty(activation.context.gc_context, Some(this)).into())
+        Ok(Self::empty(activation.context.gc_context, this).into())
     }
 
     fn as_xml(&self) -> Option<XmlObject<'gc>> {

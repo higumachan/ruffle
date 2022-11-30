@@ -8,7 +8,7 @@ use crate::avm1::property::Attribute;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{Object, ScriptObject, TObject, Value};
 use crate::avm_warn;
-use crate::backend::navigator::{NavigationMethod, RequestOptions};
+use crate::backend::navigator::{NavigationMethod, Request};
 use crate::string::AvmString;
 use gc_arena::MutationContext;
 
@@ -41,7 +41,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let object = ScriptObject::object(gc_context, Some(proto));
+    let object = ScriptObject::new(gc_context, Some(proto));
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
     object.into()
 }
@@ -102,7 +102,7 @@ fn load<'gc>(
         None => return Ok(false.into()),
     };
 
-    spawn_load_var_fetch(activation, this, &url, None)?;
+    spawn_load_var_fetch(activation, this, url, None)?;
 
     Ok(true.into())
 }
@@ -158,8 +158,8 @@ fn send<'gc>(
     };
 
     let window = match args.get(1) {
-        Some(v) => Some(v.coerce_to_string(activation)?),
-        None => None,
+        Some(v) => v.coerce_to_string(activation)?.to_string(),
+        None => "".into(),
     };
 
     let method_name = args
@@ -186,13 +186,11 @@ fn send<'gc>(
         );
     }
 
-    if let Some(window) = window {
-        activation.context.navigator.navigate_to_url(
-            url.to_string(),
-            Some(window.to_string()),
-            Some((method, form_values)),
-        );
-    }
+    activation.context.navigator.navigate_to_url(
+        url.to_string(),
+        window,
+        Some((method, form_values)),
+    );
 
     Ok(true.into())
 }
@@ -215,7 +213,7 @@ fn send_and_load<'gc>(
         .coerce_to_string(activation)?;
     let method = NavigationMethod::from_method_str(&method_name).unwrap_or(NavigationMethod::Post);
 
-    spawn_load_var_fetch(activation, target, &url, Some((this, method)))?;
+    spawn_load_var_fetch(activation, target, url, Some((this, method)))?;
 
     Ok(true.into())
 }
@@ -254,22 +252,21 @@ fn to_string<'gc>(
 fn spawn_load_var_fetch<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     loader_object: Object<'gc>,
-    url: &AvmString,
+    url: AvmString<'gc>,
     send_object: Option<(Object<'gc>, NavigationMethod)>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let (url, request_options) = if let Some((send_object, method)) = send_object {
+    let request = if let Some((send_object, method)) = send_object {
         // Send properties from `send_object`.
-        activation.object_into_request_options(send_object, url, Some(method))
+        activation.object_into_request(send_object, url, Some(method))
     } else {
         // Not sending any parameters.
-        (url.to_utf8_lossy(), RequestOptions::get())
+        Request::get(url.to_utf8_lossy().into_owned())
     };
 
     let future = activation.context.load_manager.load_form_into_load_vars(
         activation.context.player.clone(),
         loader_object,
-        &url,
-        request_options,
+        request,
     );
     activation.context.navigator.spawn_future(future);
 
@@ -283,6 +280,17 @@ fn spawn_load_var_fetch<'gc>(
         );
     } else {
         loader_object.set("_bytesLoaded", 0.into(), activation)?;
+    }
+
+    if !loader_object.has_property(activation, "_bytesTotal".into()) {
+        loader_object.define_value(
+            activation.context.gc_context,
+            "_bytesTotal",
+            Value::Undefined,
+            Attribute::DONT_DELETE | Attribute::DONT_ENUM,
+        );
+    } else {
+        loader_object.set("_bytesTotal", Value::Undefined, activation)?;
     }
 
     if !loader_object.has_property(activation, "loaded".into()) {

@@ -1,8 +1,6 @@
-use crate::avm1::activation::{
-    Activation as Avm1Activation, ActivationIdentifier as Avm1ActivationIdentifier,
-};
-use crate::avm1::object::TObject as _;
+use crate::avm1::TObject as _;
 use crate::avm1::Value as Avm1Value;
+use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier as Avm1ActivationIdentifier};
 use crate::avm1::{
     ArrayObject as Avm1ArrayObject, Error as Avm1Error, Object as Avm1Object,
     ScriptObject as Avm1ScriptObject,
@@ -10,8 +8,7 @@ use crate::avm1::{
 use crate::avm2::activation::Activation as Avm2Activation;
 use crate::avm2::object::TObject as _;
 use crate::avm2::Value as Avm2Value;
-use crate::avm2::{ArrayObject as Avm2ArrayObject, Error as Avm2Error, Object as Avm2Object};
-
+use crate::avm2::{ArrayObject as Avm2ArrayObject, Object as Avm2Object};
 use crate::context::UpdateContext;
 use crate::string::AvmString;
 use gc_arena::Collect;
@@ -159,10 +156,15 @@ impl Value {
             Value::Bool(value) => Avm1Value::Bool(value),
             Value::Number(value) => Avm1Value::Number(value),
             Value::String(value) => {
+                let value = if activation.swf_version() < 9 && value.trim().is_empty() {
+                    "null"
+                } else {
+                    &value
+                };
                 Avm1Value::String(AvmString::new_utf8(activation.context.gc_context, value))
             }
             Value::Object(values) => {
-                let object = Avm1ScriptObject::object(
+                let object = Avm1ScriptObject::new(
                     activation.context.gc_context,
                     Some(activation.context.avm1.prototypes().object),
                 );
@@ -183,34 +185,30 @@ impl Value {
         }
     }
 
-    pub fn from_avm2<'gc>(
-        activation: &mut Avm2Activation<'_, 'gc, '_>,
-        value: Avm2Value<'gc>,
-    ) -> Result<Value, Avm2Error> {
-        Ok(match value {
+    pub fn from_avm2(value: Avm2Value) -> Value {
+        match value {
             Avm2Value::Undefined | Avm2Value::Null => Value::Null,
             Avm2Value::Bool(value) => value.into(),
             Avm2Value::Number(value) => value.into(),
-            Avm2Value::Unsigned(value) => value.into(),
             Avm2Value::Integer(value) => value.into(),
             Avm2Value::String(value) => Value::String(value.to_string()),
             Avm2Value::Object(object) => {
                 if let Some(array) = object.as_array_storage() {
                     let length = array.length();
-                    let values: Result<Vec<_>, Avm2Error> = (0..length)
+                    let values = (0..length)
                         .map(|i| {
                             // FIXME - is this right?
                             let element = array.get(i).unwrap_or(Avm2Value::Null);
-                            Value::from_avm2(activation, element)
+                            Value::from_avm2(element)
                         })
                         .collect();
-                    Value::List(values?)
+                    Value::List(values)
                 } else {
                     log::warn!("from_avm2 needs to be implemented for Avm2Value::Object");
                     Value::Null
                 }
             }
-        })
+        }
     }
 
     pub fn into_avm2<'gc>(self, activation: &mut Avm2Activation<'_, 'gc, '_>) -> Avm2Value<'gc> {
@@ -259,11 +257,9 @@ impl<'gc> Callback<'gc> {
         match self {
             Callback::Avm1 { this, method } => {
                 let base_clip = context.stage.root_clip();
-                let globals = context.avm1.global_object_cell();
                 let mut activation = Avm1Activation::from_nothing(
                     context.reborrow(),
                     Avm1ActivationIdentifier::root("[ExternalInterface]"),
-                    globals,
                     base_clip,
                 );
                 let this = this.coerce_to_object(&mut activation);
@@ -287,11 +283,8 @@ impl<'gc> Callback<'gc> {
                     .into_iter()
                     .map(|v| v.into_avm2(&mut activation))
                     .collect();
-                if let Ok(result) = method
-                    .call(None, &args, &mut activation)
-                    .and_then(|value| Value::from_avm2(&mut activation, value))
-                {
-                    result
+                if let Ok(result) = method.call(None, &args, &mut activation) {
+                    Value::from_avm2(result)
                 } else {
                     Value::Null
                 }

@@ -41,7 +41,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let object = ScriptObject::object(gc_context, Some(proto));
+    let object = ScriptObject::new(gc_context, Some(proto));
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
     object.into()
 }
@@ -89,9 +89,9 @@ fn get_transform<'gc>(
     if let Some(target) = target(activation, this)? {
         let base = target.base();
         let color_transform = base.color_transform();
-        let out = ScriptObject::object(
+        let out = ScriptObject::new(
             activation.context.gc_context,
-            Some(activation.context.avm1.prototypes.object),
+            Some(activation.context.avm1.prototypes().object),
         );
         out.set(
             "ra",
@@ -134,7 +134,7 @@ fn set_rgb<'gc>(
         let rgb = args
             .get(0)
             .unwrap_or(&Value::Undefined)
-            .coerce_to_i32(activation)? as i32;
+            .coerce_to_i32(activation)?;
         let [b, g, r, _] = rgb.to_le_bytes();
 
         let mut base = target.base_mut(activation.context.gc_context);

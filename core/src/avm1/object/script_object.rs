@@ -1,6 +1,7 @@
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::function::{ExecutionName, ExecutionReason};
+use crate::avm1::object::NativeObject;
 use crate::avm1::property::{Attribute, Property};
 use crate::avm1::property_map::{Entry, PropertyMap};
 use crate::avm1::{Object, ObjectPtr, TObject, Value};
@@ -52,6 +53,7 @@ pub struct ScriptObject<'gc>(GcCell<'gc, ScriptObjectData<'gc>>);
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct ScriptObjectData<'gc> {
+    native: NativeObject<'gc>,
     properties: PropertyMap<'gc, Property<'gc>>,
     interfaces: Vec<Object<'gc>>,
     watchers: PropertyMap<'gc, Watcher<'gc>>,
@@ -67,10 +69,11 @@ impl fmt::Debug for ScriptObjectData<'_> {
 }
 
 impl<'gc> ScriptObject<'gc> {
-    pub fn object(gc_context: MutationContext<'gc, '_>, proto: Option<Object<'gc>>) -> Self {
+    pub fn new(gc_context: MutationContext<'gc, '_>, proto: Option<Object<'gc>>) -> Self {
         let object = Self(GcCell::allocate(
             gc_context,
             ScriptObjectData {
+                native: NativeObject::None,
                 properties: PropertyMap::new(),
                 interfaces: vec![],
                 watchers: PropertyMap::new(),
@@ -85,23 +88,6 @@ impl<'gc> ScriptObject<'gc> {
             );
         }
         object
-    }
-
-    /// Constructs and allocates an empty but normal object in one go.
-    pub fn object_cell(
-        gc_context: MutationContext<'gc, '_>,
-        proto: Option<Object<'gc>>,
-    ) -> Object<'gc> {
-        Self::object(gc_context, proto).into()
-    }
-
-    /// Constructs an object with no properties, not even builtins.
-    ///
-    /// Intended for constructing scope chains, since they exclusively use the
-    /// object properties, but can't just have a hashmap because of `with` and
-    /// friends.
-    pub fn bare_object(gc_context: MutationContext<'gc, '_>) -> Self {
-        Self::object(gc_context, None)
     }
 
     /// Gets the value of a data property on this object.
@@ -265,7 +251,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         this: Object<'gc>,
     ) -> Result<Object<'gc>, Error<'gc>> {
-        Ok(ScriptObject::object(activation.context.gc_context, Some(this)).into())
+        Ok(ScriptObject::new(activation.context.gc_context, Some(this)).into())
     }
 
     /// Delete a named property from the object.
@@ -498,6 +484,20 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
         self.0.write(gc_context).interfaces = iface_list;
     }
 
+    fn native(&self) -> NativeObject<'gc> {
+        self.0.read().native.clone()
+    }
+
+    fn set_native(&self, gc_context: MutationContext<'gc, '_>, native: NativeObject<'gc>) {
+        // Native object should be introduced at most once.
+        debug_assert!(matches!(self.0.read().native, NativeObject::None));
+
+        // Native object must not be `None`.
+        debug_assert!(!matches!(native, NativeObject::None));
+
+        self.0.write(gc_context).native = native;
+    }
+
     fn as_script_object(&self) -> Option<ScriptObject<'gc>> {
         Some(*self)
     }
@@ -558,7 +558,7 @@ mod tests {
         F: for<'a, 'gc> FnOnce(&mut Activation<'_, 'gc, '_>, Object<'gc>),
     {
         crate::avm1::test_utils::with_avm(swf_version, |activation, _root| {
-            let object = ScriptObject::object(
+            let object = ScriptObject::new(
                 activation.context.gc_context,
                 Some(activation.context.avm1.prototypes().object),
             )
@@ -653,8 +653,8 @@ mod tests {
             let getter = FunctionObject::function(
                 activation.context.gc_context,
                 Executable::Native(|_avm, _this, _args| Ok("Virtual!".into())),
-                None,
-                activation.context.avm1.prototypes.function,
+                activation.context.avm1.prototypes().function,
+                activation.context.avm1.prototypes().function,
             );
 
             object.as_script_object().unwrap().add_property(
@@ -679,8 +679,8 @@ mod tests {
             let getter = FunctionObject::function(
                 activation.context.gc_context,
                 Executable::Native(|_avm, _this, _args| Ok("Virtual!".into())),
-                None,
-                activation.context.avm1.prototypes.function,
+                activation.context.avm1.prototypes().function,
+                activation.context.avm1.prototypes().function,
             );
 
             object.as_script_object().unwrap().add_property(
@@ -735,8 +735,8 @@ mod tests {
             let getter = FunctionObject::function(
                 activation.context.gc_context,
                 Executable::Native(|_avm, _this, _args| Ok(Value::Null)),
-                None,
-                activation.context.avm1.prototypes.function,
+                activation.context.avm1.prototypes().function,
+                activation.context.avm1.prototypes().function,
             );
 
             object.as_script_object().unwrap().define_value(

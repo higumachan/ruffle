@@ -1,37 +1,38 @@
 //! Contexts and helper types passed between functions.
 
-use crate::avm1::globals::system::SystemProperties;
-use crate::avm1::{Avm1, Object as Avm1Object, Timers, Value as Avm1Value};
-use crate::avm2::{
-    Avm2, Event as Avm2Event, Object as Avm2Object, SoundChannelObject, Value as Avm2Value,
-};
+use crate::avm1::Avm1;
+use crate::avm1::SystemProperties;
+use crate::avm1::{Object as Avm1Object, Value as Avm1Value};
+use crate::avm2::{Avm2, Object as Avm2Object, SoundChannelObject, Value as Avm2Value};
 use crate::backend::{
     audio::{AudioBackend, AudioManager, SoundHandle, SoundInstanceHandle},
     log::LogBackend,
     navigator::NavigatorBackend,
-    render::RenderBackend,
     storage::StorageBackend,
     ui::{InputManager, UiBackend},
-    video::VideoBackend,
 };
 use crate::context_menu::ContextMenuState;
 use crate::display_object::{EditText, InteractiveObject, MovieClip, SoundTransform, Stage};
+use crate::duration::Duration;
 use crate::external::ExternalInterface;
 use crate::focus_tracker::FocusTracker;
+use crate::frame_lifecycle::FramePhase;
 use crate::library::Library;
 use crate::loader::LoadManager;
 use crate::player::Player;
 use crate::prelude::*;
 use crate::tag_utils::{SwfMovie, SwfSlice};
-use crate::transform::TransformStack;
-use crate::vminterface::AvmType;
+use crate::timer::Timers;
 use core::fmt;
 use gc_arena::{Collect, MutationContext};
 use instant::Instant;
 use rand::rngs::SmallRng;
+use ruffle_render::backend::RenderBackend;
+use ruffle_render::commands::CommandList;
+use ruffle_render::transform::TransformStack;
+use ruffle_video::backend::VideoBackend;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 /// `UpdateContext` holds shared data that is used by the various subsystems of Ruffle.
 /// `Player` creates this when it begins a tick and passes it through the call stack to
@@ -127,7 +128,10 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     pub instance_counter: &'a mut i32,
 
     /// Shared objects cache
-    pub shared_objects: &'a mut HashMap<String, Avm1Object<'gc>>,
+    pub avm1_shared_objects: &'a mut HashMap<String, Avm1Object<'gc>>,
+
+    /// Shared objects cache
+    pub avm2_shared_objects: &'a mut HashMap<String, Avm2Object<'gc>>,
 
     /// Text fields with unbound variable bindings.
     pub unbound_text_fields: &'a mut Vec<EditText<'gc>>,
@@ -167,6 +171,14 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
 
     /// The current stage frame rate.
     pub frame_rate: &'a mut f64,
+
+    /// Amount of actions performed since the last timeout check
+    pub actions_since_timeout_check: &'a mut u16,
+
+    /// The current frame processing phase.
+    ///
+    /// If we are not doing frame processing, then this is `FramePhase::Enter`.
+    pub frame_phase: &'a mut FramePhase,
 }
 
 /// Convenience methods for controlling audio.
@@ -311,7 +323,8 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             load_manager: self.load_manager,
             system: self.system,
             instance_counter: self.instance_counter,
-            shared_objects: self.shared_objects,
+            avm1_shared_objects: self.avm1_shared_objects,
+            avm2_shared_objects: self.avm2_shared_objects,
             unbound_text_fields: self.unbound_text_fields,
             timers: self.timers,
             current_context_menu: self.current_context_menu,
@@ -325,12 +338,13 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             times_get_time_called: self.times_get_time_called,
             time_offset: self.time_offset,
             frame_rate: self.frame_rate,
+            actions_since_timeout_check: self.actions_since_timeout_check,
+            frame_phase: self.frame_phase,
         }
     }
 
-    /// Return the VM that this object belongs to
-    pub fn avm_type(&self) -> AvmType {
-        self.swf.avm_type()
+    pub fn is_action_script_3(&self) -> bool {
+        self.swf.is_action_script_3()
     }
 
     pub fn avm_trace(&self, message: &str) {
@@ -341,7 +355,7 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
 /// A queued ActionScript call.
 #[derive(Collect)]
 #[collect(no_drop)]
-pub struct QueuedActions<'gc> {
+pub struct QueuedAction<'gc> {
     /// The movie clip this ActionScript is running on.
     pub clip: DisplayObject<'gc>,
 
@@ -357,7 +371,7 @@ pub struct QueuedActions<'gc> {
 #[collect(no_drop)]
 pub struct ActionQueue<'gc> {
     /// Each priority is kept in a separate bucket.
-    action_queue: Vec<VecDeque<QueuedActions<'gc>>>,
+    action_queue: [VecDeque<QueuedAction<'gc>>; ActionQueue::NUM_PRIORITIES],
 }
 
 impl<'gc> ActionQueue<'gc> {
@@ -366,24 +380,20 @@ impl<'gc> ActionQueue<'gc> {
 
     /// Crates a new `ActionQueue` with an empty queue.
     pub fn new() -> Self {
-        let mut action_queue = Vec::with_capacity(Self::NUM_PRIORITIES);
-        for _ in 0..Self::NUM_PRIORITIES {
-            action_queue.push(VecDeque::with_capacity(Self::DEFAULT_CAPACITY))
-        }
+        let action_queue = std::array::from_fn(|_| VecDeque::with_capacity(Self::DEFAULT_CAPACITY));
         Self { action_queue }
     }
 
-    /// Queues ActionScript to run for the given movie clip.
-    /// `actions` is the slice of ActionScript bytecode to run.
-    /// The actions will be skipped if the clip is removed before the actions run.
-    pub fn queue_actions(
+    /// Queues an action to run for the given movie clip.
+    /// The action will be skipped if the clip is removed before the action runs.
+    pub fn queue_action(
         &mut self,
         clip: DisplayObject<'gc>,
         action_type: ActionType<'gc>,
         is_unload: bool,
     ) {
         let priority = action_type.priority();
-        let action = QueuedActions {
+        let action = QueuedAction {
             clip,
             action_type,
             is_unload,
@@ -395,14 +405,11 @@ impl<'gc> ActionQueue<'gc> {
     }
 
     /// Sorts and drains the actions from the queue.
-    pub fn pop_action(&mut self) -> Option<QueuedActions<'gc>> {
-        for queue in self.action_queue.iter_mut().rev() {
-            let action = queue.pop_front();
-            if action.is_some() {
-                return action;
-            }
-        }
-        None
+    pub fn pop_action(&mut self) -> Option<QueuedAction<'gc>> {
+        self.action_queue
+            .iter_mut()
+            .rev()
+            .find_map(VecDeque::pop_front)
     }
 }
 
@@ -414,9 +421,16 @@ impl<'gc> Default for ActionQueue<'gc> {
 
 /// Shared data used during rendering.
 /// `Player` creates this when it renders a frame and passes it down to display objects.
-pub struct RenderContext<'a, 'gc> {
-    /// The renderer, used by the display objects to draw themselves.
+pub struct RenderContext<'a, 'gc, 'gc_context> {
+    /// The renderer, used by the display objects to register themselves.
     pub renderer: &'a mut dyn RenderBackend,
+
+    /// The command list, used by the display objects to draw themselves.
+    pub commands: &'a mut CommandList,
+
+    /// The GC MutationContext, used to perform any GcCell writes
+    /// that must occur during rendering.
+    pub gc_context: MutationContext<'gc, 'gc_context>,
 
     /// The UI backend, used to detect user interactions.
     pub ui: &'a mut dyn UiBackend,
@@ -426,6 +440,9 @@ pub struct RenderContext<'a, 'gc> {
 
     /// The transform stack controls the matrix and color transform as we traverse the display hierarchy.
     pub transform_stack: &'a mut TransformStack,
+
+    /// Whether we're rendering offscreen. This can disable some logic like Ruffle-side render culling
+    pub is_offscreen: bool,
 
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
@@ -475,9 +492,10 @@ pub enum ActionType<'gc> {
         args: Vec<Avm2Value<'gc>>,
     },
 
-    /// An AVM2 event to be dispatched.
+    /// An AVM2 event to be dispatched. This translates to an Event class instance.
+    /// Creating an Event subclass via this dispatch is TODO.
     Event2 {
-        event: Avm2Event<'gc>,
+        event_type: &'static str,
         target: Avm2Object<'gc>,
     },
 }
@@ -537,9 +555,9 @@ impl fmt::Debug for ActionType<'_> {
                 .field("reciever", reciever)
                 .field("args", args)
                 .finish(),
-            ActionType::Event2 { event, target } => f
+            ActionType::Event2 { event_type, target } => f
                 .debug_struct("ActionType::Event2")
-                .field("event", event)
+                .field("event_type", event_type)
                 .field("target", target)
                 .finish(),
         }

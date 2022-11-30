@@ -22,9 +22,3 @@ pub enum Letterbox {
     #[serde(rename = "on")]
     On,
 }
-
-impl Default for Letterbox {
-    fn default() -> Self {
-        Letterbox::Fullscreen
-    }
-}

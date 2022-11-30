@@ -1,9 +1,20 @@
 #[cfg(feature = "minimp3")]
 pub mod minimp3 {
-    use crate::backend::audio::decoders::{Decoder, SeekableDecoder};
+    use crate::backend::audio::decoders::{Decoder, Mp3Metadata, SeekableDecoder};
     use std::io::{Cursor, Read};
+    use thiserror::Error;
 
-    type Error = Box<dyn std::error::Error>;
+    #[derive(Debug, Error)]
+    pub enum Error {
+        #[error("Couldn't decode MP3 frame")]
+        FrameDecode(#[from] minimp3::Error),
+
+        #[error("Invalid sample rate")]
+        InvalidSampleRate,
+
+        #[error("Invalid channels")]
+        InvalidChannels,
+    }
 
     pub struct Mp3Decoder<R: Read> {
         decoder: minimp3::Decoder<R>,
@@ -17,8 +28,14 @@ pub mod minimp3 {
         pub fn new(reader: R) -> Result<Self, Error> {
             let mut decoder = minimp3::Decoder::new(reader);
             let frame = decoder.next_frame()?;
-            let sample_rate = frame.sample_rate.try_into()?;
-            let num_channels = frame.channels.try_into()?;
+            let sample_rate = frame
+                .sample_rate
+                .try_into()
+                .map_err(|_| Error::InvalidSampleRate)?;
+            let num_channels = frame
+                .channels
+                .try_into()
+                .map_err(|_| Error::InvalidChannels)?;
             Ok(Mp3Decoder {
                 decoder,
                 frame,
@@ -90,12 +107,21 @@ pub mod minimp3 {
             self.sample_rate
         }
     }
+
+    /// Returns the number of samples frames in the given MP3 data.
+    pub fn mp3_metadata(data: &std::sync::Arc<[u8]>) -> Result<Mp3Metadata, Error> {
+        let decoder = Mp3Decoder::new(Cursor::new(data.clone()))?;
+        Ok(Mp3Metadata {
+            sample_rate: decoder.sample_rate(),
+            num_sample_frames: decoder.count() as u32,
+        })
+    }
 }
 
 #[cfg(feature = "symphonia")]
 #[allow(dead_code)]
 pub mod symphonia {
-    use crate::backend::audio::decoders::{Decoder, SeekableDecoder};
+    use crate::backend::audio::decoders::{Decoder, Mp3Metadata, SeekableDecoder};
     use std::io::{Cursor, Read};
     use symphonia::{
         core::{
@@ -105,8 +131,22 @@ pub mod symphonia {
         },
         default::formats::Mp3Reader as SymphoniaMp3Reader,
     };
+    use thiserror::Error;
 
-    type Error = Box<dyn std::error::Error>;
+    #[derive(Debug, Error)]
+    pub enum Error {
+        #[error("Couldn't decode MP3 frame")]
+        FrameDecode(#[from] errors::Error),
+
+        #[error("No default track")]
+        NoDefaultTrack,
+
+        #[error("Invalid sample rate")]
+        InvalidSampleRate,
+
+        #[error("Invalid channels")]
+        InvalidChannels,
+    }
 
     pub struct Mp3Decoder {
         reader: SymphoniaMp3Reader,
@@ -119,28 +159,32 @@ pub mod symphonia {
     }
 
     impl Mp3Decoder {
-        const SAMPLE_BUFFER_DURATION: u64 = 4096;
+        // MP3 frames contain 1152 samples.
+        const SAMPLE_BUFFER_DURATION: u64 = 1152;
 
         pub fn new<R: 'static + Read + Send + Sync>(reader: R) -> Result<Self, Error> {
             let source = Box::new(io::ReadOnlySource::new(reader)) as Box<dyn io::MediaSource>;
             let source = io::MediaSourceStream::new(source, Default::default());
             let reader = SymphoniaMp3Reader::try_new(source, &Default::default())?;
-            let track = reader.default_track().ok_or("No default track")?;
+            let track = reader.default_track().ok_or(Error::NoDefaultTrack)?;
             let codec_params = track.codec_params.clone();
             let decoder =
                 symphonia::default::get_codecs().make(&codec_params, &Default::default())?;
-            let sample_rate = codec_params.sample_rate.ok_or("Invalid sample rate")?;
-            let channels = codec_params.channels.ok_or("Invalid number of channels")?;
+            let sample_rate = codec_params.sample_rate.ok_or(Error::InvalidSampleRate)?;
+            let channels = codec_params.channels.ok_or(Error::InvalidChannels)?;
             Ok(Mp3Decoder {
                 reader,
                 decoder,
                 sample_buf: audio::SampleBuffer::new(
-                    Self::SAMPLE_BUFFER_DURATION,
+                    0,
                     audio::SignalSpec::new(sample_rate, channels),
                 ),
                 cur_sample: 0,
-                num_channels: channels.count().try_into()?,
-                sample_rate: sample_rate.try_into()?,
+                num_channels: channels
+                    .count()
+                    .try_into()
+                    .map_err(|_| Error::InvalidChannels)?,
+                sample_rate: sample_rate.try_into().map_err(|_| Error::InvalidChannels)?,
                 stream_ended: false,
             })
         }
@@ -151,13 +195,12 @@ pub mod symphonia {
             let source = Box::new(reader) as Box<dyn io::MediaSource>;
             let source = io::MediaSourceStream::new(source, Default::default());
             let reader = SymphoniaMp3Reader::try_new(source, &Default::default()).unwrap();
-            let track = reader.default_track().unwrap();
+            let track = reader.default_track().ok_or(Error::NoDefaultTrack)?;
             let codec_params = track.codec_params.clone();
-            let decoder = symphonia::default::get_codecs()
-                .make(&codec_params, &Default::default())
-                .unwrap();
-            let sample_rate = codec_params.sample_rate.ok_or("Invalid sample rate")?;
-            let channels = codec_params.channels.ok_or("Invalid number of channels")?;
+            let decoder =
+                symphonia::default::get_codecs().make(&codec_params, &Default::default())?;
+            let sample_rate = codec_params.sample_rate.ok_or(Error::InvalidSampleRate)?;
+            let channels = codec_params.channels.ok_or(Error::InvalidChannels)?;
             Ok(Mp3Decoder {
                 reader,
                 decoder,
@@ -181,7 +224,8 @@ pub mod symphonia {
             while let Ok(packet) = self.reader.next_packet() {
                 match self.decoder.decode(&packet) {
                     Ok(decoded) => {
-                        if self.sample_buf.is_empty() {
+                        if self.sample_buf.capacity() < decoded.capacity() {
+                            // Ensure our buffer has enough space for the decoded samples.
                             self.sample_buf = audio::SampleBuffer::new(
                                 decoded.capacity() as core::units::Duration,
                                 *decoded.spec(),
@@ -229,11 +273,30 @@ pub mod symphonia {
     impl SeekableDecoder for Mp3Decoder {
         #[inline]
         fn reset(&mut self) {
-            let _ = self.reader.seek(
+            self.seek_to_sample_frame(0);
+        }
+
+        #[inline]
+        fn seek_to_sample_frame(&mut self, frame: u32) {
+            // Seek to the desired position,
+            let seek_result = self.reader.seek(
                 formats::SeekMode::Accurate,
-                formats::SeekTo::TimeStamp { track_id: 0, ts: 0 },
+                formats::SeekTo::TimeStamp {
+                    track_id: 0,
+                    ts: frame.into(),
+                },
             );
-            self.cur_sample = self.sample_buf.len();
+            self.sample_buf.clear();
+            self.decoder.reset();
+            self.cur_sample = 0;
+            self.stream_ended = false;
+            // Seeking isn't exact, so we may end up slightly before our desired position.
+            // Pump samples until we get to the exact position.
+            let samples_remaining =
+                seek_result.map_or(0, |seek| seek.required_ts.saturating_sub(seek.actual_ts));
+            for _ in 0..samples_remaining {
+                self.next();
+            }
         }
     }
 
@@ -247,5 +310,22 @@ pub mod symphonia {
         fn sample_rate(&self) -> u16 {
             self.sample_rate
         }
+    }
+
+    /// Returns the sample rate and length of the given MP3.
+    pub fn mp3_metadata(data: &std::sync::Arc<[u8]>) -> Result<Mp3Metadata, Error> {
+        let source =
+            io::MediaSourceStream::new(Box::new(Cursor::new(data.clone())), Default::default());
+        let reader = SymphoniaMp3Reader::try_new(source, &Default::default())?;
+        let track = reader.default_track().ok_or(Error::NoDefaultTrack)?;
+        let num_sample_frames = track.codec_params.n_frames.unwrap_or_default() as u32;
+        let sample_rate = track
+            .codec_params
+            .sample_rate
+            .ok_or(Error::InvalidSampleRate)? as u16;
+        Ok(Mp3Metadata {
+            num_sample_frames,
+            sample_rate,
+        })
     }
 }

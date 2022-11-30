@@ -1,10 +1,11 @@
-use crate::backend::render::{RenderBackend, ShapeHandle};
 use crate::html::TextSpan;
 use crate::prelude::*;
 use crate::string::WStr;
-use crate::transform::Transform;
 use gc_arena::{Collect, Gc, MutationContext};
+use ruffle_render::backend::{RenderBackend, ShapeHandle};
+use ruffle_render::transform::Transform;
 use std::cell::{Cell, Ref, RefCell};
+use std::cmp::max;
 
 pub use swf::TextGridFit;
 
@@ -12,8 +13,6 @@ pub use swf::TextGridFit;
 pub fn round_down_to_pixel(t: Twips) -> Twips {
     Twips::from_pixels(t.to_pixels().floor())
 }
-
-type Error = Box<dyn std::error::Error>;
 
 /// Parameters necessary to evaluate a font.
 #[derive(Copy, Clone, Debug, Collect)]
@@ -90,7 +89,6 @@ struct FontData {
 
     /// The distance from the baseline of the font to the bottom of each glyph,
     /// in EM-square coordinates.
-    #[allow(dead_code)]
     descent: u16,
 
     /// The distance between the bottom of any one glyph and the top of
@@ -107,7 +105,7 @@ impl<'gc> Font<'gc> {
         renderer: &mut dyn RenderBackend,
         tag: swf::Font,
         encoding: &'static swf::Encoding,
-    ) -> Result<Font<'gc>, Error> {
+    ) -> Font<'gc> {
         let mut glyphs = vec![];
         let mut code_point_to_glyph = fnv::FnvHashMap::default();
 
@@ -147,7 +145,7 @@ impl<'gc> Font<'gc> {
             fnv::FnvHashMap::default()
         };
 
-        Ok(Font(Gc::allocate(
+        Font(Gc::allocate(
             gc_context,
             FontData {
                 glyphs,
@@ -162,7 +160,7 @@ impl<'gc> Font<'gc> {
                 leading,
                 descriptor,
             },
-        )))
+        ))
     }
 
     /// Returns whether this font contains glyph shapes.
@@ -227,6 +225,13 @@ impl<'gc> Font<'gc> {
         let scale = height.get() as f32 / self.scale();
 
         Twips::new((self.0.ascent as f32 * scale) as i32)
+    }
+
+    /// Get the descent from the baseline to the bottom of the glyph at a given height.
+    pub fn get_descent_for_height(&self, height: Twips) -> Twips {
+        let scale = height.get() as f32 / self.scale();
+
+        Twips::new((self.0.descent as f32 * scale) as i32)
     }
 
     /// Returns whether this font contains kerning information.
@@ -309,6 +314,10 @@ impl<'gc> Font<'gc> {
                 }
             },
         );
+
+        if text.is_empty() {
+            height = max(height, params.height);
+        }
 
         (width, height)
     }
@@ -432,7 +441,9 @@ impl Glyph {
     pub fn as_shape(&self) -> Ref<'_, swf::Shape> {
         let mut write = self.shape.borrow_mut();
         if write.is_none() {
-            *write = Some(crate::shape_utils::swf_glyph_to_shape(&self.swf_glyph));
+            *write = Some(ruffle_render::shape_utils::swf_glyph_to_shape(
+                &self.swf_glyph,
+            ));
         }
         drop(write);
         let read = self.shape.borrow();
@@ -501,7 +512,15 @@ impl FontDescriptor {
 pub enum TextRenderSettings {
     /// This text should render with the standard rendering engine.
     /// Set via "Anti-alias for animation" in the Flash IDE.
-    Default,
+    ///
+    /// The `grid_fit`, `thickness`, and `sharpness` parameters are present
+    /// because they are retained when switching from `Advanced` to `Normal`
+    /// rendering and vice versa. They are not used in Normal rendering.
+    Normal {
+        grid_fit: TextGridFit,
+        thickness: f32,
+        sharpness: f32,
+    },
 
     /// This text should render with the advanced rendering engine.
     /// Set via "Anti-alias for readibility" in the Flash IDE.
@@ -519,11 +538,125 @@ impl TextRenderSettings {
     pub fn is_advanced(&self) -> bool {
         matches!(self, TextRenderSettings::Advanced { .. })
     }
-}
 
-impl Default for TextRenderSettings {
-    fn default() -> Self {
-        TextRenderSettings::Default
+    pub fn with_advanced_rendering(self) -> Self {
+        match self {
+            TextRenderSettings::Advanced { .. } => self,
+            TextRenderSettings::Normal {
+                grid_fit,
+                thickness,
+                sharpness,
+            } => TextRenderSettings::Advanced {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+        }
+    }
+
+    pub fn with_normal_rendering(self) -> Self {
+        match self {
+            TextRenderSettings::Normal { .. } => self,
+            TextRenderSettings::Advanced {
+                grid_fit,
+                thickness,
+                sharpness,
+            } => TextRenderSettings::Normal {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+        }
+    }
+
+    pub fn sharpness(&self) -> f32 {
+        match self {
+            TextRenderSettings::Normal { sharpness, .. } => *sharpness,
+            TextRenderSettings::Advanced { sharpness, .. } => *sharpness,
+        }
+    }
+
+    pub fn with_sharpness(self, sharpness: f32) -> Self {
+        match self {
+            TextRenderSettings::Normal {
+                grid_fit,
+                thickness,
+                sharpness: _,
+            } => TextRenderSettings::Normal {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+            TextRenderSettings::Advanced {
+                grid_fit,
+                thickness,
+                sharpness: _,
+            } => TextRenderSettings::Advanced {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+        }
+    }
+
+    pub fn thickness(&self) -> f32 {
+        match self {
+            TextRenderSettings::Normal { thickness, .. } => *thickness,
+            TextRenderSettings::Advanced { thickness, .. } => *thickness,
+        }
+    }
+
+    pub fn with_thickness(self, thickness: f32) -> Self {
+        match self {
+            TextRenderSettings::Normal {
+                grid_fit,
+                thickness: _,
+                sharpness,
+            } => TextRenderSettings::Normal {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+            TextRenderSettings::Advanced {
+                grid_fit,
+                thickness: _,
+                sharpness,
+            } => TextRenderSettings::Advanced {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+        }
+    }
+
+    pub fn grid_fit(&self) -> swf::TextGridFit {
+        match self {
+            TextRenderSettings::Normal { grid_fit, .. } => *grid_fit,
+            TextRenderSettings::Advanced { grid_fit, .. } => *grid_fit,
+        }
+    }
+
+    pub fn with_grid_fit(self, grid_fit: TextGridFit) -> Self {
+        match self {
+            TextRenderSettings::Normal {
+                grid_fit: _,
+                thickness,
+                sharpness,
+            } => TextRenderSettings::Normal {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+            TextRenderSettings::Advanced {
+                grid_fit: _,
+                thickness,
+                sharpness,
+            } => TextRenderSettings::Advanced {
+                grid_fit,
+                thickness,
+                sharpness,
+            },
+        }
     }
 }
 
@@ -536,19 +669,28 @@ impl From<swf::CsmTextSettings> for TextRenderSettings {
                 sharpness: settings.sharpness,
             }
         } else {
-            TextRenderSettings::Default
+            TextRenderSettings::default()
+        }
+    }
+}
+
+impl Default for TextRenderSettings {
+    fn default() -> Self {
+        Self::Normal {
+            grid_fit: TextGridFit::Pixel,
+            thickness: 0.0,
+            sharpness: 0.0,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::render::{NullRenderer, RenderBackend};
     use crate::font::{EvalParameters, Font};
-    use crate::player::{Player, DEVICE_FONT_TAG};
+    use crate::player::Player;
     use crate::string::WStr;
     use gc_arena::{rootless_arena, MutationContext};
-    use std::ops::DerefMut;
+    use ruffle_render::backend::{null::NullRenderer, ViewportDimensions};
     use swf::Twips;
 
     fn with_device_font<F>(callback: F)
@@ -556,9 +698,12 @@ mod tests {
         F: for<'gc> FnOnce(MutationContext<'gc, '_>, Font<'gc>),
     {
         rootless_arena(|mc| {
-            let mut renderer: Box<dyn RenderBackend> = Box::new(NullRenderer::new());
-            let device_font =
-                Player::load_device_font(mc, DEVICE_FONT_TAG, renderer.deref_mut()).unwrap();
+            let mut renderer = NullRenderer::new(ViewportDimensions {
+                width: 0,
+                height: 0,
+                scale_factor: 1.0,
+            });
+            let device_font = Player::load_device_font(mc, &mut renderer);
 
             callback(mc, device_font);
         })

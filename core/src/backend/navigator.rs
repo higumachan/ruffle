@@ -7,21 +7,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use swf::avm1::types::SendVarsMethod;
-use url::{ParseError, Url};
-
-/// Attempt to convert a relative URL into an absolute URL, using the base URL
-/// if necessary.
-///
-/// If the relative URL is actually absolute, then the base will not be used.
-pub fn url_from_relative_url(base: &str, relative: &str) -> Result<Url, ParseError> {
-    let parsed = Url::parse(relative);
-    if let Err(ParseError::RelativeUrlWithoutBase) = parsed {
-        let base = Url::parse(base)?;
-        return base.join(relative);
-    }
-
-    parsed
-}
+use url::Url;
 
 /// Enumerates all possible navigation methods.
 #[derive(Copy, Clone)]
@@ -54,8 +40,11 @@ impl NavigationMethod {
     }
 }
 
-/// Represents request options to be sent as part of a fetch.
-pub struct RequestOptions {
+/// A fetch request.
+pub struct Request {
+    /// The URL of the request.
+    url: String,
+
     /// The HTTP method to be used to make the request.
     method: NavigationMethod,
 
@@ -66,21 +55,34 @@ pub struct RequestOptions {
     body: Option<(Vec<u8>, String)>,
 }
 
-impl RequestOptions {
-    /// Construct request options for a GET request.
-    pub fn get() -> Self {
+impl Request {
+    /// Construct a GET request.
+    pub fn get(url: String) -> Self {
         Self {
+            url,
             method: NavigationMethod::Get,
             body: None,
         }
     }
 
-    /// Construct request options for a POST request.
-    pub fn post(body: Option<(Vec<u8>, String)>) -> Self {
+    /// Construct a POST request.
+    pub fn post(url: String, body: Option<(Vec<u8>, String)>) -> Self {
         Self {
+            url,
             method: NavigationMethod::Post,
             body,
         }
+    }
+
+    /// Construct a request with the given method and data
+    #[allow(clippy::self_named_constructors)]
+    pub fn request(method: NavigationMethod, url: String, body: Option<(Vec<u8>, String)>) -> Self {
+        Self { url, method, body }
+    }
+
+    /// Retrieve the URL of this request.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Retrieve the navigation method for this request.
@@ -115,8 +117,8 @@ pub trait NavigatorBackend {
     /// be meaningful for all environments: for example, `javascript:` URLs may
     /// not be executable in a desktop context.
     ///
-    /// The `window` parameter, if provided, should be treated identically to
-    /// the `window` parameter on an HTML `<a>nchor` tag.
+    /// The `target` parameter, should be treated identically to the `target`
+    /// parameter on an HTML `<a>nchor` tag.
     ///
     /// This function may be used to send variables to an eligible target. If
     /// desired, the `vars_method` will be specified with a suitable
@@ -134,12 +136,12 @@ pub trait NavigatorBackend {
     fn navigate_to_url(
         &self,
         url: String,
-        window: Option<String>,
+        target: String,
         vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     );
 
-    /// Fetch data at a given URL and return it some time in the future.
-    fn fetch(&self, url: &str, request_options: RequestOptions) -> OwnedFuture<Response, Error>;
+    /// Fetch data and return it some time in the future.
+    fn fetch(&self, request: Request) -> OwnedFuture<Response, Error>;
 
     /// Arrange for a future to be run at some point in the... well, future.
     ///
@@ -275,14 +277,14 @@ impl NavigatorBackend for NullNavigatorBackend {
     fn navigate_to_url(
         &self,
         _url: String,
-        _window: Option<String>,
+        _target: String,
         _vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     ) {
     }
 
-    fn fetch(&self, url: &str, _opts: RequestOptions) -> OwnedFuture<Response, Error> {
+    fn fetch(&self, request: Request) -> OwnedFuture<Response, Error> {
         let mut path = self.relative_base_path.clone();
-        path.push(url);
+        path.push(request.url);
 
         Box::pin(async move {
             let url = Self::url_from_file_path(&path)

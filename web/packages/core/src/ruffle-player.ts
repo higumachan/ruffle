@@ -1,25 +1,24 @@
-import { Ruffle } from "../pkg/ruffle_web";
-
+import type { Ruffle } from "../pkg/ruffle_web";
 import { loadRuffle } from "./load-ruffle";
 import { ruffleShadowTemplate } from "./shadow-template";
 import { lookupElement } from "./register-element";
-import { Config } from "./config";
+import type { Config } from "./config";
+import { DEFAULT_CONFIG } from "./config";
 import {
-    BaseLoadOptions,
     DataLoadOptions,
     URLLoadOptions,
     AutoPlay,
     UnmuteOverlay,
     WindowMode,
 } from "./load-options";
-import { MovieMetadata } from "./movie-metadata";
-import { InternalContextMenuItem } from "./context-menu";
+import type { MovieMetadata } from "./movie-metadata";
+import type { InternalContextMenuItem } from "./context-menu";
 import { swfFileName } from "./swf-file-name";
 
 export const FLASH_MIMETYPE = "application/x-shockwave-flash";
 export const FUTURESPLASH_MIMETYPE = "application/futuresplash";
 export const FLASH7_AND_8_MIMETYPE = "application/x-shockwave-flash2-preview";
-export const FLASH_MOVIE_MIMETYPE = "application/vnd.adobe.flash-movie";
+export const FLASH_MOVIE_MIMETYPE = "application/vnd.adobe.flash.movie";
 export const FLASH_ACTIVEX_CLASSID =
     "clsid:D27CDB6E-AE6D-11cf-96B8-444553540000";
 
@@ -122,11 +121,12 @@ export class RufflePlayer extends HTMLElement {
     private container: HTMLElement;
     private playButton: HTMLElement;
     private unmuteOverlay: HTMLElement;
+    private preloader: HTMLElement;
 
     // Firefox has a read-only "contextMenu" property,
     // so avoid shadowing it.
     private contextMenuElement: HTMLElement;
-    private hasContextMenu = false;
+
     // Allows the user to permanently disable the context menu.
     private contextMenuForceDisabled = false;
 
@@ -134,12 +134,13 @@ export class RufflePlayer extends HTMLElement {
     // Set to true when a touch event is encountered.
     private isTouch = false;
 
+    // The effective config loaded upon `.load()`.
+    private loadedConfig: Required<Config> = DEFAULT_CONFIG;
+
     private swfUrl?: URL;
     private instance: Ruffle | null;
-    private options: BaseLoadOptions | null;
     private lastActivePlayingState: boolean;
 
-    private showSwfDownload = false;
     private _metadata: MovieMetadata | null;
     private _readyState: ReadyState;
 
@@ -211,11 +212,10 @@ export class RufflePlayer extends HTMLElement {
         );
         this.container = this.shadow.getElementById("container")!;
         this.playButton = this.shadow.getElementById("play_button")!;
-        if (this.playButton) {
-            this.playButton.addEventListener("click", () => this.play());
-        }
+        this.playButton.addEventListener("click", () => this.play());
 
         this.unmuteOverlay = this.shadow.getElementById("unmute_overlay")!;
+        this.preloader = this.shadow.getElementById("preloader")!;
 
         this.contextMenuElement = this.shadow.getElementById("context-menu")!;
         this.addEventListener("contextmenu", this.showContextMenu.bind(this));
@@ -231,7 +231,6 @@ export class RufflePlayer extends HTMLElement {
         window.addEventListener("click", this.hideContextMenu.bind(this));
 
         this.instance = null;
-        this.options = null;
         this.onFSCommand = null;
 
         this._readyState = ReadyState.HaveNothing;
@@ -389,10 +388,16 @@ export class RufflePlayer extends HTMLElement {
      *
      * @private
      */
-    private async ensureFreshInstance(config: BaseLoadOptions): Promise<void> {
+    private async ensureFreshInstance(): Promise<void> {
         this.destroy();
 
-        const ruffleConstructor = await loadRuffle(config).catch((e) => {
+        if (this.loadedConfig.preloader !== false) {
+            this.showPreloader();
+        }
+        const ruffleConstructor = await loadRuffle(
+            this.loadedConfig,
+            this.onRuffleDownloadProgress.bind(this)
+        ).catch((e) => {
             console.error(`Serious error loading Ruffle: ${e}`);
 
             // Serious duck typing. In error conditions, let's not make assumptions.
@@ -434,7 +439,7 @@ export class RufflePlayer extends HTMLElement {
         this.instance = await new ruffleConstructor(
             this.container,
             this,
-            config
+            this.loadedConfig
         );
         console.log(
             "New Ruffle instance created (WebAssembly extensions: " +
@@ -457,17 +462,17 @@ export class RufflePlayer extends HTMLElement {
 
         this.unmuteAudioContext();
 
-        // Treat unspecified and invalid values as `AutoPlay.Auto`.
+        // Treat invalid values as `AutoPlay.Auto`.
         if (
-            config.autoplay === AutoPlay.On ||
-            (config.autoplay !== AutoPlay.Off &&
+            this.loadedConfig.autoplay === AutoPlay.On ||
+            (this.loadedConfig.autoplay !== AutoPlay.Off &&
                 this.audioState() === "running")
         ) {
             this.play();
 
             if (this.audioState() !== "running") {
-                // Treat unspecified and invalid values as `UnmuteOverlay.Visible`.
-                if (config.unmuteOverlay !== UnmuteOverlay.Hidden) {
+                // Treat invalid values as `UnmuteOverlay.Visible`.
+                if (this.loadedConfig.unmuteOverlay !== UnmuteOverlay.Hidden) {
                     this.unmuteOverlay.style.display = "block";
                 }
 
@@ -495,6 +500,28 @@ export class RufflePlayer extends HTMLElement {
     }
 
     /**
+     * Uploads the preloader progress bar.
+     *
+     * @param bytesLoaded The size of the Ruffle WebAssembly file downloaded so far.
+     * @param bytesTotal The total size of the Ruffle WebAssembly file.
+     */
+    private onRuffleDownloadProgress(bytesLoaded: number, bytesTotal: number) {
+        const loadBar = <HTMLElement>(
+            this.preloader.querySelector(".loadbarInner")
+        );
+        const outerLoadbar = <HTMLElement>(
+            this.preloader.querySelector(".loadbar")
+        );
+        if (Number.isNaN(bytesTotal)) {
+            if (outerLoadbar) {
+                outerLoadbar.style.display = "none";
+            }
+        } else {
+            loadBar.style.width = `${100.0 * (bytesLoaded / bytesTotal)}%`;
+        }
+    }
+
+    /**
      * Destroys the currently running instance of Ruffle.
      */
     private destroy(): void {
@@ -505,6 +532,39 @@ export class RufflePlayer extends HTMLElement {
             this._readyState = ReadyState.HaveNothing;
             console.log("Ruffle instance destroyed.");
         }
+    }
+
+    private checkOptions(
+        options: string | URLLoadOptions | DataLoadOptions
+    ): URLLoadOptions | DataLoadOptions {
+        if (typeof options === "string") {
+            return { url: options };
+        }
+
+        const check: (
+            condition: boolean,
+            message: string
+        ) => asserts condition = (condition, message) => {
+            if (!condition) {
+                const error = new TypeError(message);
+                error.ruffleIndexError = PanicError.JavascriptConfiguration;
+                this.panic(error);
+                throw error;
+            }
+        };
+        check(
+            options !== null && typeof options === "object",
+            "Argument 0 must be a string or object"
+        );
+        check(
+            "url" in options || "data" in options,
+            "Argument 0 must contain a `url` or `data` key"
+        );
+        check(
+            !("url" in options) || typeof options.url === "string",
+            "`url` must be a string"
+        );
+        return options;
     }
 
     /**
@@ -523,34 +583,7 @@ export class RufflePlayer extends HTMLElement {
     async load(
         options: string | URLLoadOptions | DataLoadOptions
     ): Promise<void> {
-        let optionsError = "";
-        switch (typeof options) {
-            case "string":
-                options = { url: options };
-                break;
-            case "object":
-                if (options === null) {
-                    optionsError = "Argument 0 must be a string or object";
-                } else if (!("url" in options) && !("data" in options)) {
-                    optionsError =
-                        "Argument 0 must contain a `url` or `data` key";
-                } else if (
-                    "url" in options &&
-                    typeof options.url !== "string"
-                ) {
-                    optionsError = "`url` must be a string";
-                }
-                break;
-            default:
-                optionsError = "Argument 0 must be a string or object";
-                break;
-        }
-        if (optionsError.length > 0) {
-            const error = new TypeError(optionsError);
-            error.ruffleIndexError = PanicError.JavascriptConfiguration;
-            this.panic(error);
-            throw error;
-        }
+        options = this.checkOptions(options);
 
         if (!this.isConnected || this.isUnusedFallbackObject()) {
             console.warn(
@@ -565,31 +598,31 @@ export class RufflePlayer extends HTMLElement {
         }
 
         try {
-            const config: BaseLoadOptions = {
+            this.loadedConfig = {
+                ...DEFAULT_CONFIG,
                 ...(window.RufflePlayer?.config ?? {}),
                 ...this.config,
                 ...options,
             };
-            // `allowScriptAccess` can only be set in `options`.
-            config.allowScriptAccess = options.allowScriptAccess;
 
-            this.showSwfDownload = config.showSwfDownload === true;
-            this.options = options;
-            this.hasContextMenu = config.contextMenu !== false;
+            // `allowScriptAccess` can only be set in `options`.
+            this.loadedConfig.allowScriptAccess =
+                options.allowScriptAccess === true;
 
             // Pre-emptively set background color of container while Ruffle/SWF loads.
             if (
-                config.backgroundColor &&
-                config.wmode !== WindowMode.Transparent
+                this.loadedConfig.backgroundColor &&
+                this.loadedConfig.wmode !== WindowMode.Transparent
             ) {
-                this.container.style.backgroundColor = config.backgroundColor;
+                this.container.style.backgroundColor =
+                    this.loadedConfig.backgroundColor;
             }
 
-            await this.ensureFreshInstance(config);
+            await this.ensureFreshInstance();
 
             if ("url" in options) {
                 console.log(`Loading SWF file ${options.url}`);
-                this.swfUrl = new URL(options.url, document.location.href);
+                this.swfUrl = new URL(options.url, document.baseURI);
 
                 const parameters = {
                     ...sanitizeParameters(
@@ -618,9 +651,7 @@ export class RufflePlayer extends HTMLElement {
     play(): void {
         if (this.instance) {
             this.instance.play();
-            if (this.playButton) {
-                this.playButton.style.display = "none";
-            }
+            this.playButton.style.display = "none";
         }
     }
 
@@ -634,6 +665,29 @@ export class RufflePlayer extends HTMLElement {
             return this.instance.is_playing();
         }
         return false;
+    }
+
+    /**
+     * Returns the master volume of the player.
+     *
+     * @returns The volume. 1.0 is 100% volume.
+     */
+    get volume(): number {
+        if (this.instance) {
+            return this.instance.volume();
+        }
+        return 1.0;
+    }
+
+    /**
+     * Sets the master volume of the player.
+     *
+     * @param value The volume. 1.0 is 100% volume.
+     */
+    set volume(value: number) {
+        if (this.instance) {
+            this.instance.set_volume(value);
+        }
     }
 
     /**
@@ -786,11 +840,23 @@ export class RufflePlayer extends HTMLElement {
             }
         }
 
-        if (this.instance && this.swfUrl && this.showSwfDownload) {
+        if (
+            this.instance &&
+            this.swfUrl &&
+            this.loadedConfig.showSwfDownload === true
+        ) {
             items.push(null);
             items.push({
-                text: `Download .swf`,
+                text: "Download .swf",
                 onClick: this.downloadSwf.bind(this),
+            });
+        }
+
+        if (window.isSecureContext) {
+            items.push({
+                text: "Copy debug info",
+                onClick: () =>
+                    navigator.clipboard.writeText(this.getPanicData()),
             });
         }
 
@@ -816,7 +882,10 @@ export class RufflePlayer extends HTMLElement {
     private showContextMenu(e: MouseEvent): void {
         e.preventDefault();
 
-        if (!this.hasContextMenu || this.contextMenuForceDisabled) {
+        if (
+            this.loadedConfig.contextMenu === false ||
+            this.contextMenuForceDisabled
+        ) {
             return;
         }
 
@@ -890,9 +959,7 @@ export class RufflePlayer extends HTMLElement {
     pause(): void {
         if (this.instance) {
             this.instance.pause();
-            if (this.playButton) {
-                this.playButton.style.display = "block";
-            }
+            this.playButton.style.display = "block";
         }
     }
 
@@ -912,9 +979,7 @@ export class RufflePlayer extends HTMLElement {
                     audioContext.resume();
                 }
             }
-            if (this.unmuteOverlay) {
-                this.unmuteOverlay.style.display = "none";
-            }
+            this.unmuteOverlay.style.display = "none";
         }
     }
 
@@ -1068,6 +1133,43 @@ export class RufflePlayer extends HTMLElement {
     }
 
     /**
+     * Get data included in any panic of this ruffle-player
+     *
+     * @returns A string containing all the data included in the panic.
+     */
+    private getPanicData(): string {
+        const dataArray = [];
+        dataArray.push("\n# Player Info\n");
+        dataArray.push(this.debugPlayerInfo());
+
+        dataArray.push("\n# Page Info\n");
+        dataArray.push(`Page URL: ${document.location.href}\n`);
+        if (this.swfUrl) dataArray.push(`SWF URL: ${this.swfUrl}\n`);
+
+        dataArray.push("\n# Browser Info\n");
+        dataArray.push(`User Agent: ${window.navigator.userAgent}\n`);
+        dataArray.push(`Platform: ${window.navigator.platform}\n`);
+        dataArray.push(
+            `Has touch support: ${window.navigator.maxTouchPoints > 0}\n`
+        );
+
+        dataArray.push("\n# Ruffle Info\n");
+        dataArray.push(`Version: %VERSION_NUMBER%\n`);
+        dataArray.push(`Name: %VERSION_NAME%\n`);
+        dataArray.push(`Channel: %VERSION_CHANNEL%\n`);
+        dataArray.push(`Built: %BUILD_DATE%\n`);
+        dataArray.push(`Commit: %COMMIT_HASH%\n`);
+        dataArray.push(`Is extension: ${this.isExtension}\n`);
+        dataArray.push("\n# Metadata\n");
+        if (this.metadata) {
+            for (const [key, value] of Object.entries(this.metadata)) {
+                dataArray.push(`${key}: ${value}\n`);
+            }
+        }
+        return dataArray.join("");
+    }
+
+    /**
      * Panics this specific player, forcefully destroying all resources and displays an error message to the user.
      *
      * This should be called when something went absolutely, incredibly and disastrously wrong and there is no chance
@@ -1086,6 +1188,7 @@ export class RufflePlayer extends HTMLElement {
             return;
         }
         this.panicked = true;
+        this.hidePreloader();
 
         if (
             error instanceof Error &&
@@ -1100,8 +1203,10 @@ export class RufflePlayer extends HTMLElement {
 
         const errorArray: Array<string | null> & {
             stackIndex: number;
+            avmStackIndex: number;
         } = Object.assign([], {
             stackIndex: -1,
+            avmStackIndex: -1,
         });
 
         errorArray.push("# Error Info\n");
@@ -1114,33 +1219,22 @@ export class RufflePlayer extends HTMLElement {
                     errorArray.push(
                         `Error stack:\n\`\`\`\n${error.stack}\n\`\`\`\n`
                     ) - 1;
+                if (error.avmStack) {
+                    const avmStackIndex =
+                        errorArray.push(
+                            `AVM2 stack:\n\`\`\`\n    ${error.avmStack
+                                .trim()
+                                .replace(/\t/g, "    ")}\n\`\`\`\n`
+                        ) - 1;
+                    errorArray.avmStackIndex = avmStackIndex;
+                }
                 errorArray.stackIndex = stackIndex;
             }
         } else {
             errorArray.push(`Error: ${error}\n`);
         }
 
-        errorArray.push("\n# Player Info\n");
-        errorArray.push(this.debugPlayerInfo());
-
-        errorArray.push("\n# Page Info\n");
-        errorArray.push(`Page URL: ${document.location.href}\n`);
-        if (this.swfUrl) errorArray.push(`SWF URL: ${this.swfUrl}\n`);
-
-        errorArray.push("\n# Browser Info\n");
-        errorArray.push(`User Agent: ${window.navigator.userAgent}\n`);
-        errorArray.push(`Platform: ${window.navigator.platform}\n`);
-        errorArray.push(
-            `Has touch support: ${window.navigator.maxTouchPoints > 0}\n`
-        );
-
-        errorArray.push("\n# Ruffle Info\n");
-        errorArray.push(`Version: %VERSION_NUMBER%\n`);
-        errorArray.push(`Name: %VERSION_NAME%\n`);
-        errorArray.push(`Channel: %VERSION_CHANNEL%\n`);
-        errorArray.push(`Built: %BUILD_DATE%\n`);
-        errorArray.push(`Commit: %COMMIT_HASH%\n`);
-        errorArray.push(`Is extension: ${this.isExtension}\n`);
+        errorArray.push(this.getPanicData());
 
         const errorText = errorArray.join("");
 
@@ -1167,6 +1261,9 @@ export class RufflePlayer extends HTMLElement {
                 // Strip the stack error from the array when the produced URL is way too long.
                 // This should prevent "414 Request-URI Too Large" errors on GitHub.
                 errorArray[errorArray.stackIndex] = null;
+                if (errorArray.avmStackIndex > -1) {
+                    errorArray[errorArray.avmStackIndex] = null;
+                }
                 issueBody = encodeURIComponent(errorArray.join(""));
             }
             issueLink += issueBody;
@@ -1365,6 +1462,7 @@ export class RufflePlayer extends HTMLElement {
             return;
         }
 
+        this.hidePreloader();
         const div = document.createElement("div");
         div.id = "message_overlay";
         div.innerHTML = `<div class="message">
@@ -1416,15 +1514,28 @@ export class RufflePlayer extends HTMLElement {
     }
 
     protected debugPlayerInfo(): string {
-        return `Allows script access: ${
-            this.options?.allowScriptAccess ?? false
-        }\n`;
+        let result = `Allows script access: ${this.loadedConfig.allowScriptAccess}\n`;
+        if (this.instance) {
+            result += `Renderer: ${this.instance.renderer_name()}\n`;
+        }
+        return result;
+    }
+
+    private hidePreloader(): void {
+        this.preloader.classList.add("hidden");
+        this.container.classList.remove("hidden");
+    }
+
+    private showPreloader(): void {
+        this.preloader.classList.remove("hidden");
+        this.container.classList.add("hidden");
     }
 
     private setMetadata(metadata: MovieMetadata) {
         this._metadata = metadata;
         // TODO: Switch this to ReadyState.Loading when we have streaming support.
         this._readyState = ReadyState.Loaded;
+        this.hidePreloader();
         this.dispatchEvent(new Event(RufflePlayer.LOADED_METADATA));
         // TODO: Move this to whatever function changes the ReadyState to Loaded when we have streaming support.
         this.dispatchEvent(new Event(RufflePlayer.LOADED_DATA));
@@ -1582,6 +1693,24 @@ export function isSwfFilename(filename: string | null): boolean {
         }
     }
     return false;
+}
+
+/**
+ * Returns whether the given MIME type is a known flash type.
+ *
+ * @param mime The MIME type to test.
+ * @returns True if the MIME type is a flash MIME type.
+ */
+export function isSwfMimeType(mime: string): boolean {
+    switch (mime.toLowerCase()) {
+        case FLASH_MIMETYPE.toLowerCase():
+        case FUTURESPLASH_MIMETYPE.toLowerCase():
+        case FLASH7_AND_8_MIMETYPE.toLowerCase():
+        case FLASH_MOVIE_MIMETYPE.toLowerCase():
+            return true;
+        default:
+            return false;
+    }
 }
 
 /**

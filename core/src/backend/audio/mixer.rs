@@ -1,12 +1,45 @@
-use super::decoders::{
-    self, AdpcmDecoder, Decoder, NellymoserDecoder, PcmDecoder, SeekableDecoder,
-};
+use super::decoders::{self, AdpcmDecoder, Decoder, PcmDecoder, SeekableDecoder};
 use super::{SoundHandle, SoundInstanceHandle, SoundTransform};
+use crate::backend::audio::{DecodeError, RegisterError};
+use crate::duration::Duration;
 use crate::tag_utils::SwfSlice;
 use generational_arena::Arena;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use swf::AudioCompression;
+
+/// Holds the last 2048 output audio frames. Frames can be written to it one by
+/// one, and the last completely filled 1024-wide window can be read from it.
+struct CircBuf {
+    pub samples: [[f32; 2]; 2048],
+    pub pos: usize,
+}
+
+impl CircBuf {
+    /// Creates an empty circular buffer.
+    pub fn new() -> Self {
+        Self {
+            samples: [[0.0; 2]; 2048],
+            pos: 0,
+        }
+    }
+
+    /// Writes a value into the buffer, pushing the write position forward.
+    pub fn push(&mut self, sample: [f32; 2]) {
+        self.samples[self.pos] = sample;
+        self.pos = (self.pos + 1) % 2048;
+    }
+
+    /// Returns one half of the inner buffer, the one that is not currently
+    /// being written to.
+    pub fn get(&self) -> &[[f32; 2]; 1024] {
+        if self.pos < 1024 {
+            self.samples[1024..2048].try_into().unwrap()
+        } else {
+            self.samples[0..1024].try_into().unwrap()
+        }
+    }
+}
 
 /// An audio mixer for a Flash movie.
 ///
@@ -22,14 +55,18 @@ pub struct AudioMixer {
     /// The list of actively playing sound instances.
     sound_instances: Arc<Mutex<Arena<SoundInstance>>>,
 
+    /// The master volume of the audio from [0.0, 1.0].
+    volume: Arc<RwLock<f32>>,
+
     /// The number of channels in the output stream. Must be 1 or 2.
     num_output_channels: u8,
 
     /// The sample rate of the output stream in Hz.
     output_sample_rate: u32,
-}
 
-type Error = Box<dyn std::error::Error>;
+    /// The last two windows of output samples.
+    output_memory: Arc<RwLock<CircBuf>>,
+}
 
 /// An audio stream.
 trait Stream: dasp::signal::Signal<Frame = [i16; 2]> + Send + Sync {
@@ -144,6 +181,52 @@ struct SoundInstance {
 
     /// The transform for the right channel of this sound instance.
     right_transform: [f32; 2],
+
+    /// Stores the per-channel "peak amplitude" (volume) of this sound
+    /// over the last completely mixed 1024-frame long window.
+    /// Updated whenever a new buffer is filled completely.
+    peak: [f32; 2],
+
+    /// Accumulates the per-channel minimum and maximum sample values
+    /// (respectively) of this sound over the buffer currently being
+    /// mixed. Used to compute `peak`, and is reset after every time.
+    range: ([f32; 2], [f32; 2]),
+}
+
+impl SoundInstance {
+    /// Creates a new `SoundInstance` from a `Stream`, with a SoundHandle.
+    fn new_sound(handle: SoundHandle, stream: Box<dyn Stream>) -> Self {
+        SoundInstance {
+            handle: Some(handle),
+            stream,
+            active: true,
+            left_transform: [1.0, 0.0],
+            right_transform: [0.0, 1.0],
+            peak: [0.0, 0.0],
+            range: ([std::f32::INFINITY; 2], [std::f32::NEG_INFINITY; 2]),
+        }
+    }
+
+    /// Creates a new `SoundInstance` from a `Stream`, for stream sounds.
+    fn new_stream(stream: Box<dyn Stream>) -> Self {
+        SoundInstance {
+            handle: None,
+            stream,
+            active: true,
+            left_transform: [1.0, 0.0],
+            right_transform: [0.0, 1.0],
+            peak: [0.0, 0.0],
+            range: ([std::f32::INFINITY; 2], [std::f32::NEG_INFINITY; 2]),
+        }
+    }
+
+    /// Updates `peak` from `range`, and resets the latter to default.
+    fn update_peak(&mut self) {
+        self.peak[0] = (self.range.1[0] - self.range.0[0]) / 2.0;
+        self.peak[1] = (self.range.1[1] - self.range.0[1]) / 2.0;
+
+        self.range = ([std::f32::INFINITY; 2], [std::f32::NEG_INFINITY; 2]);
+    }
 }
 
 impl AudioMixer {
@@ -152,8 +235,10 @@ impl AudioMixer {
         Self {
             sounds: Arena::new(),
             sound_instances: Arc::new(Mutex::new(Arena::new())),
+            volume: Arc::new(RwLock::new(1.0)),
             num_output_channels,
             output_sample_rate,
+            output_memory: Arc::new(RwLock::new(CircBuf::new())),
         }
     }
 
@@ -161,7 +246,9 @@ impl AudioMixer {
     pub fn proxy(&self) -> AudioMixerProxy {
         AudioMixerProxy {
             sound_instances: Arc::clone(&self.sound_instances),
+            volume: Arc::clone(&self.volume),
             num_output_channels: self.num_output_channels,
+            output_memory: Arc::clone(&self.output_memory),
         }
     }
 
@@ -171,16 +258,22 @@ impl AudioMixer {
     /// `output_buffer` is expected to be in 2-channel interleaved format.
     pub fn mix<'a, T>(&mut self, output_buffer: &mut [T])
     where
-        T: 'a + dasp::Sample + Default,
-        T::Signed: dasp::sample::conv::FromSample<i16>,
-        T::Float: dasp::sample::conv::FromSample<f32>,
+        T: 'a
+            + Default
+            + dasp::Sample<Signed = T>
+            + dasp::sample::ToSample<f32>
+            + dasp::sample::FromSample<i16>,
     {
         let mut sound_instances = self.sound_instances.lock().unwrap();
+        let volume = *self.volume.read().unwrap();
+        let mut output_memory = self.output_memory.write().unwrap();
         Self::mix_audio::<T>(
             &mut sound_instances,
+            volume,
             self.num_output_channels,
             output_buffer,
-        )
+            &mut output_memory,
+        );
     }
 
     /// Instantiate a seekable decoder for audio data with the given format.
@@ -191,8 +284,18 @@ impl AudioMixer {
     fn make_seekable_decoder(
         format: &swf::SoundFormat,
         data: Cursor<ArcAsRef>,
-    ) -> Result<Box<dyn SeekableDecoder>, Error> {
+    ) -> Result<Box<dyn SeekableDecoder>, decoders::Error> {
         let decoder: Box<dyn SeekableDecoder> = match format.compression {
+            AudioCompression::UncompressedUnknownEndian => {
+                // Cross fingers that it's little endian.
+                log::warn!("make_decoder: PCM sound is unknown endian; assuming little endian");
+                Box::new(PcmDecoder::new(
+                    data,
+                    format.is_stereo,
+                    format.sample_rate,
+                    format.is_16_bit,
+                ))
+            }
             AudioCompression::Uncompressed => Box::new(PcmDecoder::new(
                 data,
                 format.is_stereo,
@@ -208,17 +311,12 @@ impl AudioMixer {
             AudioCompression::Mp3 => Box::new(decoders::Mp3Decoder::new(data)?),
             #[cfg(all(feature = "symphonia", not(feature = "minimp3")))]
             AudioCompression::Mp3 => Box::new(decoders::Mp3Decoder::new_seekable(data)?),
-            AudioCompression::Nellymoser => {
-                Box::new(NellymoserDecoder::new(data, format.sample_rate.into()))
-            }
-            _ => {
-                let msg = format!(
-                    "start_stream: Unhandled audio compression {:?}",
-                    format.compression
-                );
-                log::error!("{}", msg);
-                return Err(msg.into());
-            }
+            #[cfg(feature = "nellymoser")]
+            AudioCompression::Nellymoser => Box::new(decoders::NellymoserDecoder::new(
+                data,
+                format.sample_rate.into(),
+            )),
+            _ => return Err(decoders::Error::UnhandledCompression(format.compression)),
         };
         Ok(decoder)
     }
@@ -247,7 +345,7 @@ impl AudioMixer {
         sound: &Sound,
         settings: &swf::SoundInfo,
         data: Cursor<ArcAsRef>,
-    ) -> Result<Box<dyn Stream>, Error> {
+    ) -> Result<Box<dyn Stream>, DecodeError> {
         // Instantiate a decoder for the compression that the sound data uses.
         let decoder = Self::make_seekable_decoder(&sound.format, data)?;
 
@@ -277,7 +375,7 @@ impl AudioMixer {
         &self,
         format: &swf::SoundFormat,
         data_stream: R,
-    ) -> Result<Box<dyn Stream>, Error> {
+    ) -> Result<Box<dyn Stream>, DecodeError> {
         // Instantiate a decoder for the compression that the sound data uses.
         let decoder = decoders::make_decoder(format, data_stream)?;
 
@@ -292,7 +390,7 @@ impl AudioMixer {
         &self,
         stream_info: &swf::SoundStreamHead,
         data_stream: SwfSlice,
-    ) -> Result<Box<dyn 'a + Stream>, Error> {
+    ) -> Result<Box<dyn 'a + Stream>, DecodeError> {
         // Instantiate a decoder for the compression that the sound data uses.
         let clip_stream_decoder = decoders::make_stream_decoder(stream_info, data_stream)?;
 
@@ -307,18 +405,24 @@ impl AudioMixer {
     /// and mixing in their output.
     fn mix_audio<'a, T>(
         sound_instances: &mut Arena<SoundInstance>,
+        volume: f32,
         num_channels: u8,
         mut output_buffer: &mut [T],
+        output_memory: &mut CircBuf,
     ) where
-        T: 'a + Default + dasp::Sample,
-        T::Signed: dasp::sample::conv::FromSample<i16>,
-        T::Float: dasp::sample::conv::FromSample<f32>,
+        T: 'a
+            + Default
+            + dasp::Sample<Signed = T>
+            + dasp::sample::ToSample<f32>
+            + dasp::sample::FromSample<i16>,
     {
         use dasp::{
             frame::{Frame, Stereo},
             Sample,
         };
         use std::ops::DerefMut;
+
+        let volume = volume.to_sample();
 
         // For each sample, mix the samples from all active sound instances.
         for buf_frame in output_buffer
@@ -331,18 +435,34 @@ impl AudioMixer {
                     let sound_frame = sound.stream.next();
                     let [left_0, left_1] = sound_frame.mul_amp(sound.left_transform);
                     let [right_0, right_1] = sound_frame.mul_amp(sound.right_transform);
-                    let sound_frame: Stereo<T::Signed> = [
+                    let mut sound_frame: Stereo<T> = [
                         Sample::add_amp(left_0, left_1).to_sample(),
                         Sample::add_amp(right_0, right_1).to_sample(),
                     ];
+                    sound_frame = sound_frame.scale_amp(volume);
+
+                    sound.range.0[0] = sound.range.0[0].min(sound_frame[0].to_sample());
+                    sound.range.0[1] = sound.range.0[1].min(sound_frame[1].to_sample());
+
+                    sound.range.1[0] = sound.range.1[0].max(sound_frame[0].to_sample());
+                    sound.range.1[1] = sound.range.1[1].max(sound_frame[1].to_sample());
+
                     output_frame = output_frame.add_amp(sound_frame);
                 } else {
                     sound.active = false;
                 }
             }
 
+            output_memory.push([output_frame[0].to_sample(), output_frame[1].to_sample()]);
+
+            if output_memory.pos == 0 || output_memory.pos == 1024 {
+                for (_, sound) in sound_instances.iter_mut() {
+                    sound.update_peak();
+                }
+            }
+
             for (buf_sample, output_sample) in buf_frame.iter_mut().zip(output_frame.iter()) {
-                *buf_sample = output_sample.to_sample();
+                *buf_sample = *output_sample;
             }
         }
 
@@ -350,10 +470,19 @@ impl AudioMixer {
         sound_instances.retain(|_, sound| sound.active);
     }
 
-    /// Registers a sound with the audio mixer.
-    pub fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, Error> {
+    pub fn get_sample_history(&self) -> [[f32; 2]; 1024] {
+        let output_memory = self.output_memory.read().unwrap();
+
+        *output_memory.get()
+    }
+
+    /// Registers an embedded SWF sound with the audio mixer.
+    pub fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
         // Slice off latency seek for MP3 data.
         let (skip_sample_frames, data) = if swf_sound.format.compression == AudioCompression::Mp3 {
+            if swf_sound.data.len() < 2 {
+                return Err(RegisterError::ShortMp3);
+            }
             let skip_sample_frames = u16::from_le_bytes([swf_sound.data[0], swf_sound.data[1]]);
             (skip_sample_frames, &swf_sound.data[2..])
         } else {
@@ -369,6 +498,31 @@ impl AudioMixer {
         Ok(self.sounds.insert(sound))
     }
 
+    /// Registers an external MP3 with the audio mixer.
+    #[cfg(any(feature = "symphonia", feature = "minimp3"))]
+    pub fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError> {
+        let data = Arc::from(data);
+        // Validate that this is actually MP3 data, and calculate duration and sample rate.
+        let metadata = decoders::mp3_metadata(&data)?;
+        let sound = Sound {
+            format: swf::SoundFormat {
+                compression: AudioCompression::Mp3,
+                sample_rate: metadata.sample_rate,
+                is_stereo: true,
+                is_16_bit: true,
+            },
+            data,
+            num_sample_frames: metadata.num_sample_frames,
+            skip_sample_frames: 0,
+        };
+        Ok(self.sounds.insert(sound))
+    }
+
+    #[cfg(not(any(feature = "symphonia", feature = "minimp3")))]
+    pub fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError> {
+        Err(decoders::Error::UnhandledCompression(AudioCompression::Mp3))
+    }
+
     /// Starts a timeline audio stream.
     pub fn start_stream(
         &mut self,
@@ -376,20 +530,14 @@ impl AudioMixer {
         _clip_frame: u16,
         clip_data: SwfSlice,
         stream_info: &swf::SoundStreamHead,
-    ) -> Result<SoundInstanceHandle, Error> {
+    ) -> Result<SoundInstanceHandle, DecodeError> {
         // The audio data for stream sounds is distributed among the frames of a
         // movie clip. The stream tag reader will parse through the SWF and
         // feed the decoder audio data on the fly.
         let stream = self.make_stream_from_swf_slice(stream_info, clip_data)?;
 
         let mut sound_instances = self.sound_instances.lock().unwrap();
-        let handle = sound_instances.insert(SoundInstance {
-            handle: None,
-            stream,
-            active: true,
-            left_transform: [1.0, 0.0],
-            right_transform: [0.0, 1.0],
-        });
+        let handle = sound_instances.insert(SoundInstance::new_stream(stream));
         Ok(handle)
     }
 
@@ -400,7 +548,7 @@ impl AudioMixer {
         &mut self,
         sound_handle: SoundHandle,
         settings: &swf::SoundInfo,
-    ) -> Result<SoundInstanceHandle, Error> {
+    ) -> Result<SoundInstanceHandle, DecodeError> {
         let sound = &self.sounds[sound_handle];
         let data = Cursor::new(ArcAsRef(Arc::clone(&sound.data)));
         // Create a stream that decodes and resamples the sound.
@@ -419,13 +567,7 @@ impl AudioMixer {
 
         // Add sound instance to active list.
         let mut sound_instances = self.sound_instances.lock().unwrap();
-        let handle = sound_instances.insert(SoundInstance {
-            handle: Some(sound_handle),
-            stream,
-            active: true,
-            left_transform: [1.0, 0.0],
-            right_transform: [0.0, 1.0],
-        });
+        let handle = sound_instances.insert(SoundInstance::new_sound(sound_handle, stream));
         Ok(handle)
     }
 
@@ -450,29 +592,31 @@ impl AudioMixer {
     /// Returns the position of a playing sound in milliseconds.
     ///
     ////// Returns `None` if the sound is no longer playing.
-    pub fn get_sound_position(&self, instance: SoundInstanceHandle) -> Option<f64> {
+    pub fn get_sound_position(&self, instance: SoundInstanceHandle) -> Option<Duration> {
         let sound_instances = self.sound_instances.lock().unwrap();
         sound_instances.get(instance).map(|instance| {
             // Get the current sample position from the underlying audio source.
             let num_sample_frames: f64 = instance.stream.source_position().into();
             let sample_rate: f64 = instance.stream.source_sample_rate().into();
-            num_sample_frames * 1000.0 / sample_rate
+            Duration::from_millis(num_sample_frames * 1000.0 / sample_rate)
         })
+    }
+
+    pub fn get_sound_peak(&self, instance: SoundInstanceHandle) -> Option<[f32; 2]> {
+        let sound_instances = self.sound_instances.lock().unwrap();
+        sound_instances.get(instance).map(|instance| instance.peak)
     }
 
     /// Returns the duration of a registered sound in milliseconds.
     ///
     /// Returns `None` if the sound is not registered or invalid.
-    pub fn get_sound_duration(&self, sound: SoundHandle) -> Option<f64> {
-        if let Some(sound) = self.sounds.get(sound) {
+    pub fn get_sound_duration(&self, sound: SoundHandle) -> Option<Duration> {
+        self.sounds.get(sound).map(|sound| {
             // AS duration does not subtract `skip_sample_frames`.
             let num_sample_frames: f64 = sound.num_sample_frames.into();
             let sample_rate: f64 = sound.format.sample_rate.into();
-            let ms = num_sample_frames * 1000.0 / sample_rate;
-            Some(ms)
-        } else {
-            None
-        }
+            Duration::from_millis(num_sample_frames * 1000.0 / sample_rate)
+        })
     }
 
     pub fn get_sound_size(&self, sound: SoundHandle) -> Option<u32> {
@@ -495,6 +639,14 @@ impl AudioMixer {
             instance.right_transform = [transform.left_to_right, transform.right_to_right];
         }
     }
+
+    pub fn volume(&self) -> f32 {
+        *self.volume.read().unwrap()
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        *self.volume.write().unwrap() = volume
+    }
 }
 
 /// A thread-safe proxy to the main `AudioMixer`, allowing for mixing audio from a different thread.
@@ -505,8 +657,13 @@ pub struct AudioMixerProxy {
     /// The list of actively playing sound instances.
     sound_instances: Arc<Mutex<Arena<SoundInstance>>>,
 
+    /// The master volume of the audio from [0.0, 1.0].
+    volume: Arc<RwLock<f32>>,
+
     /// The number of channels in the output stream. Must be 1 or 2.
     num_output_channels: u8,
+
+    output_memory: Arc<RwLock<CircBuf>>,
 }
 
 impl AudioMixerProxy {
@@ -516,15 +673,21 @@ impl AudioMixerProxy {
     /// `output_buffer` is expected to be in 2-channel interleaved format.
     pub fn mix<'a, T>(&self, output_buffer: &mut [T])
     where
-        T: 'a + dasp::Sample + Default,
-        T::Signed: dasp::sample::conv::FromSample<i16>,
-        T::Float: dasp::sample::conv::FromSample<f32>,
+        T: 'a
+            + Default
+            + dasp::Sample<Signed = T>
+            + dasp::sample::ToSample<f32>
+            + dasp::sample::FromSample<i16>,
     {
         let mut sound_instances = self.sound_instances.lock().unwrap();
+        let volume = *self.volume.read().unwrap();
+        let mut output_memory = self.output_memory.write().unwrap();
         AudioMixer::mix_audio::<T>(
             &mut sound_instances,
+            volume,
             self.num_output_channels,
             output_buffer,
+            &mut output_memory,
         )
     }
 }
@@ -838,8 +1001,13 @@ impl dasp::signal::Signal for EnvelopeSignal {
 macro_rules! impl_audio_mixer_backend {
     ($mixer:ident) => {
         #[inline]
-        fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, Error> {
+        fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
             self.$mixer.register_sound(swf_sound)
+        }
+
+        #[inline]
+        fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError> {
+            self.$mixer.register_mp3(data)
         }
 
         #[inline]
@@ -849,7 +1017,7 @@ macro_rules! impl_audio_mixer_backend {
             clip_frame: u16,
             clip_data: $crate::tag_utils::SwfSlice,
             stream_info: &swf::SoundStreamHead,
-        ) -> Result<SoundInstanceHandle, Error> {
+        ) -> Result<SoundInstanceHandle, DecodeError> {
             self.$mixer
                 .start_stream(stream_handle, clip_frame, clip_data, stream_info)
         }
@@ -859,7 +1027,7 @@ macro_rules! impl_audio_mixer_backend {
             &mut self,
             sound_handle: SoundHandle,
             settings: &swf::SoundInfo,
-        ) -> Result<SoundInstanceHandle, Error> {
+        ) -> Result<SoundInstanceHandle, DecodeError> {
             self.$mixer.start_sound(sound_handle, settings)
         }
 
@@ -874,12 +1042,12 @@ macro_rules! impl_audio_mixer_backend {
         }
 
         #[inline]
-        fn get_sound_position(&self, instance: SoundInstanceHandle) -> Option<f64> {
+        fn get_sound_position(&self, instance: SoundInstanceHandle) -> Option<Duration> {
             self.$mixer.get_sound_position(instance)
         }
 
         #[inline]
-        fn get_sound_duration(&self, sound: SoundHandle) -> Option<f64> {
+        fn get_sound_duration(&self, sound: SoundHandle) -> Option<Duration> {
             self.$mixer.get_sound_duration(sound)
         }
 
@@ -900,6 +1068,25 @@ macro_rules! impl_audio_mixer_backend {
             transform: SoundTransform,
         ) {
             self.$mixer.set_sound_transform(instance, transform)
+        }
+
+        #[inline]
+        fn get_sound_peak(&mut self, instance: SoundInstanceHandle) -> Option<[f32; 2]> {
+            self.$mixer.get_sound_peak(instance)
+        }
+
+        #[inline]
+        fn volume(&self) -> f32 {
+            self.$mixer.volume()
+        }
+
+        #[inline]
+        fn set_volume(&mut self, volume: f32) {
+            self.$mixer.set_volume(volume)
+        }
+
+        fn get_sample_history(&self) -> [[f32; 2]; 1024] {
+            self.$mixer.get_sample_history()
         }
     };
 }

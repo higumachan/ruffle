@@ -1,19 +1,20 @@
 //! `TextFormat` impl
 
-use crate::avm1::object::text_format_object::TextFormatObject;
+use crate::avm1::object::NativeObject;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
-use crate::avm1::{Activation, ArrayObject, AvmString, Error, Object, TObject, Value};
+use crate::avm1::{Activation, ArrayObject, Error, Object, ScriptObject, TObject, Value};
 use crate::avm_warn;
+use crate::display_object::{AutoSizeMode, EditText, TDisplayObject};
 use crate::ecma_conversions::round_to_even;
 use crate::html::TextFormat;
-use crate::string::WStr;
-use gc_arena::MutationContext;
+use crate::string::{AvmString, WStr};
+use gc_arena::{GcCell, MutationContext};
 
 macro_rules! getter {
     ($name:ident) => {
         |activation, this, _args| {
-            if let Some(text_format) = this.as_text_format_object() {
-                return Ok($name(activation, &text_format.text_format()));
+            if let NativeObject::TextFormat(text_format) = this.native() {
+                return Ok($name(activation, &text_format.read()));
             }
             Ok(Value::Undefined)
         }
@@ -23,13 +24,24 @@ macro_rules! getter {
 macro_rules! setter {
     ($name:ident) => {
         |activation, this, args| {
-            if let Some(text_format) = this.as_text_format_object() {
+            if let NativeObject::TextFormat(text_format) = this.native() {
                 let value = args.get(0).unwrap_or(&Value::Undefined);
                 $name(
                     activation,
-                    &mut text_format.text_format_mut(activation.context.gc_context),
+                    &mut text_format.write(activation.context.gc_context),
                     value,
                 )?;
+            }
+            Ok(Value::Undefined)
+        }
+    };
+}
+
+macro_rules! method {
+    ($name:ident) => {
+        |activation, this, args| {
+            if let NativeObject::TextFormat(text_format) = this.native() {
+                return $name(activation, &text_format.read(), args);
             }
             Ok(Value::Undefined)
         }
@@ -56,6 +68,7 @@ const PROTO_DECLS: &[Declaration] = declare_properties! {
     "display" => property(getter!(display), setter!(set_display));
     "kerning" => property(getter!(kerning), setter!(set_kerning));
     "letterSpacing" => property(getter!(letter_spacing), setter!(set_letter_spacing));
+    "getTextExtent" => method(method!(get_text_extent); DONT_ENUM | DONT_DELETE);
 };
 
 fn font<'gc>(activation: &mut Activation<'_, 'gc, '_>, text_format: &TextFormat) -> Value<'gc> {
@@ -464,81 +477,148 @@ fn set_letter_spacing<'gc>(
     Ok(())
 }
 
+fn get_text_extent<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    text_format: &TextFormat,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let movie = activation.base_clip().movie().unwrap();
+    let text = args
+        .get(0)
+        .cloned()
+        .unwrap_or(Value::Undefined)
+        .coerce_to_string(activation)?;
+    let width = args
+        .get(1)
+        .cloned()
+        .map(|v| v.coerce_to_f64(activation))
+        .transpose()?;
+
+    let temp_edittext = EditText::new(
+        &mut activation.context,
+        movie,
+        0.0,
+        0.0,
+        width.unwrap_or(0.0),
+        0.0,
+    );
+
+    temp_edittext.set_autosize(AutoSizeMode::Left, &mut activation.context);
+    temp_edittext.set_word_wrap(width.is_some(), &mut activation.context);
+    temp_edittext.set_new_text_format(text_format.clone(), &mut activation.context);
+    temp_edittext.set_text(&text, &mut activation.context);
+
+    let result = ScriptObject::new(activation.context.gc_context, None);
+    let metrics = temp_edittext
+        .layout_metrics(None)
+        .expect("All text boxes should have at least one line at all times");
+
+    result.set_data(
+        "ascent".into(),
+        metrics.ascent.to_pixels().into(),
+        activation,
+    )?;
+    result.set_data(
+        "descent".into(),
+        metrics.descent.to_pixels().into(),
+        activation,
+    )?;
+    result.set_data("width".into(), metrics.width.to_pixels().into(), activation)?;
+    result.set_data(
+        "height".into(),
+        metrics.height.to_pixels().into(),
+        activation,
+    )?;
+    result.set_data(
+        "textFieldHeight".into(),
+        temp_edittext.height().into(),
+        activation,
+    )?;
+    result.set_data(
+        "textFieldWidth".into(),
+        temp_edittext.width().into(),
+        activation,
+    )?;
+
+    Ok(result.into())
+}
+
 /// `TextFormat` constructor
 pub fn constructor<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Object<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Some(this) = this.as_text_format_object() {
-        let mut text_format = this.text_format_mut(activation.context.gc_context);
-        set_font(
-            activation,
-            &mut text_format,
-            args.get(0).unwrap_or(&Value::Undefined),
-        )?;
-        set_size(
-            activation,
-            &mut text_format,
-            args.get(1).unwrap_or(&Value::Undefined),
-        )?;
-        set_color(
-            activation,
-            &mut text_format,
-            args.get(2).unwrap_or(&Value::Undefined),
-        )?;
-        set_bold(
-            activation,
-            &mut text_format,
-            args.get(3).unwrap_or(&Value::Undefined),
-        )?;
-        set_italic(
-            activation,
-            &mut text_format,
-            args.get(4).unwrap_or(&Value::Undefined),
-        )?;
-        set_underline(
-            activation,
-            &mut text_format,
-            args.get(5).unwrap_or(&Value::Undefined),
-        )?;
-        set_url(
-            activation,
-            &mut text_format,
-            args.get(6).unwrap_or(&Value::Undefined),
-        )?;
-        set_target(
-            activation,
-            &mut text_format,
-            args.get(7).unwrap_or(&Value::Undefined),
-        )?;
-        set_align(
-            activation,
-            &mut text_format,
-            args.get(8).unwrap_or(&Value::Undefined),
-        )?;
-        set_left_margin(
-            activation,
-            &mut text_format,
-            args.get(9).unwrap_or(&Value::Undefined),
-        )?;
-        set_right_margin(
-            activation,
-            &mut text_format,
-            args.get(10).unwrap_or(&Value::Undefined),
-        )?;
-        set_indent(
-            activation,
-            &mut text_format,
-            args.get(11).unwrap_or(&Value::Undefined),
-        )?;
-        set_leading(
-            activation,
-            &mut text_format,
-            args.get(12).unwrap_or(&Value::Undefined),
-        )?;
-    }
-
+    let mut text_format = Default::default();
+    set_font(
+        activation,
+        &mut text_format,
+        args.get(0).unwrap_or(&Value::Undefined),
+    )?;
+    set_size(
+        activation,
+        &mut text_format,
+        args.get(1).unwrap_or(&Value::Undefined),
+    )?;
+    set_color(
+        activation,
+        &mut text_format,
+        args.get(2).unwrap_or(&Value::Undefined),
+    )?;
+    set_bold(
+        activation,
+        &mut text_format,
+        args.get(3).unwrap_or(&Value::Undefined),
+    )?;
+    set_italic(
+        activation,
+        &mut text_format,
+        args.get(4).unwrap_or(&Value::Undefined),
+    )?;
+    set_underline(
+        activation,
+        &mut text_format,
+        args.get(5).unwrap_or(&Value::Undefined),
+    )?;
+    set_url(
+        activation,
+        &mut text_format,
+        args.get(6).unwrap_or(&Value::Undefined),
+    )?;
+    set_target(
+        activation,
+        &mut text_format,
+        args.get(7).unwrap_or(&Value::Undefined),
+    )?;
+    set_align(
+        activation,
+        &mut text_format,
+        args.get(8).unwrap_or(&Value::Undefined),
+    )?;
+    set_left_margin(
+        activation,
+        &mut text_format,
+        args.get(9).unwrap_or(&Value::Undefined),
+    )?;
+    set_right_margin(
+        activation,
+        &mut text_format,
+        args.get(10).unwrap_or(&Value::Undefined),
+    )?;
+    set_indent(
+        activation,
+        &mut text_format,
+        args.get(11).unwrap_or(&Value::Undefined),
+    )?;
+    set_leading(
+        activation,
+        &mut text_format,
+        args.get(12).unwrap_or(&Value::Undefined),
+    )?;
+    this.set_native(
+        activation.context.gc_context,
+        NativeObject::TextFormat(GcCell::allocate(activation.context.gc_context, text_format)),
+    );
     Ok(this.into())
 }
 
@@ -548,8 +628,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let text_format = TextFormatObject::empty_object(gc_context, Some(proto));
-    let object = text_format.as_script_object().unwrap();
+    let object = ScriptObject::new(gc_context, Some(proto));
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
-    text_format.into()
+    object.into()
 }

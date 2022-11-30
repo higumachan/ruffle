@@ -6,14 +6,16 @@ use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::display_object::DisplayObject;
+use crate::display_object::TDisplayObject;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
+use std::fmt::Debug;
 
 /// A class instance allocator that allocates Stage objects.
 pub fn stage_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
+) -> Result<Object<'gc>, Error<'gc>> {
     let base = ScriptObjectData::new(class);
 
     Ok(StageObject(GcCell::allocate(
@@ -26,7 +28,7 @@ pub fn stage_allocator<'gc>(
     .into())
 }
 
-#[derive(Clone, Collect, Debug, Copy)]
+#[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
 pub struct StageObject<'gc>(GcCell<'gc, StageObjectData<'gc>>);
 
@@ -55,7 +57,7 @@ impl<'gc> StageObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         display_object: DisplayObject<'gc>,
         class: ClassObject<'gc>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let mut instance = Self(GcCell::allocate(
             activation.context.gc_context,
             StageObjectData {
@@ -77,7 +79,7 @@ impl<'gc> StageObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         display_object: DisplayObject<'gc>,
         class: ClassObject<'gc>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let this = Self::for_display_object(activation, display_object, class)?;
 
         class.call_native_init(Some(this.into()), &[], activation)?;
@@ -89,7 +91,7 @@ impl<'gc> StageObject<'gc> {
     pub fn graphics(
         activation: &mut Activation<'_, 'gc, '_>,
         display_object: DisplayObject<'gc>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let class = activation.avm2().classes().graphics;
         let mut this = Self(GcCell::allocate(
             activation.context.gc_context,
@@ -123,11 +125,31 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
         self.0.read().display_object
     }
 
-    fn init_display_object(&self, mc: MutationContext<'gc, '_>, obj: DisplayObject<'gc>) {
+    fn init_display_object(&self, mc: MutationContext<'gc, '_>, mut obj: DisplayObject<'gc>) {
         self.0.write(mc).display_object = Some(obj);
+        obj.set_object2(mc, (*self).into());
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
+    }
+}
+
+impl<'gc> Debug for StageObject<'gc> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self.0.try_read() {
+            Ok(obj) => f
+                .debug_struct("StageObject")
+                .field("name", &obj.base.debug_class_name())
+                .field("display_object", &obj.display_object)
+                .field("ptr", &self.0.as_ptr())
+                .finish(),
+            Err(err) => f
+                .debug_struct("StageObject")
+                .field("name", &err)
+                .field("display_object", &err)
+                .field("ptr", &self.0.as_ptr())
+                .finish(),
+        }
     }
 }

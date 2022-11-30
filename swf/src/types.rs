@@ -2,17 +2,41 @@
 //!
 //! These structures are documented in the Adobe SWF File Format Specification
 //! version 19 (henceforth SWF19):
-//! https://www.adobe.com/content/dam/acom/en/devnet/pdf/swf-file-format-spec.pdf
+//! <https://www.adobe.com/content/dam/acom/en/devnet/pdf/swf-file-format-spec.pdf>
+
 use crate::string::SwfStr;
 use bitflags::bitflags;
+use enum_map::Enum;
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 
+mod bevel_filter;
+mod blur_filter;
+mod color;
+mod color_matrix_filter;
+mod convolution_filter;
+mod drop_shadow_filter;
 mod fixed;
+mod glow_filter;
+mod gradient_filter;
 mod matrix;
+mod rectangle;
 mod twips;
+mod twips_2d;
 
-pub use fixed::*;
+pub use bevel_filter::BevelFilter;
+pub use blur_filter::BlurFilter;
+pub use color::Color;
+pub use color_matrix_filter::ColorMatrixFilter;
+pub use convolution_filter::ConvolutionFilter;
+pub use drop_shadow_filter::DropShadowFilter;
+pub use fixed::{Fixed16, Fixed8};
+pub use glow_filter::GlowFilter;
+pub use gradient_filter::GradientFilter;
 pub use matrix::Matrix;
+pub use rectangle::Rectangle;
 pub use twips::Twips;
+pub use twips_2d::Twips2d;
 
 /// A complete header and tags in the SWF file.
 /// This is returned by the `swf::parse_swf` convenience method.
@@ -41,7 +65,7 @@ pub struct SwfBuf {
 pub struct Header {
     pub compression: Compression,
     pub version: u8,
-    pub stage_size: Rectangle,
+    pub stage_size: Rectangle<Twips>,
     pub frame_rate: Fixed8,
     pub num_frames: u16,
 }
@@ -133,7 +157,7 @@ impl HeaderExt {
 
     /// The stage dimensions of this SWF.
     #[inline]
-    pub fn stage_size(&self) -> &Rectangle {
+    pub fn stage_size(&self) -> &Rectangle<Twips> {
         &self.header.stage_size
     }
 
@@ -182,128 +206,6 @@ pub enum Compression {
     None,
     Zlib,
     Lzma,
-}
-
-/// A rectangular region defined by minimum
-/// and maximum x- and y-coordinate positions
-/// measured in [`Twips`].
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Rectangle {
-    /// The minimum x-position of the rectangle.
-    pub x_min: Twips,
-
-    /// The maximum x-position of the rectangle.
-    pub x_max: Twips,
-
-    /// The minimum y-position of the rectangle.
-    pub y_min: Twips,
-
-    /// The maximum y-position of the rectangle.
-    pub y_max: Twips,
-}
-
-/// An RGBA (red, green, blue, alpha) color.
-///
-/// All components are stored as [`u8`] and have a color range of 0-255.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Color {
-    /// The red component value.
-    pub r: u8,
-
-    /// The green component value.
-    pub g: u8,
-
-    /// The blue component value.
-    pub b: u8,
-
-    /// The alpha component value.
-    pub a: u8,
-}
-
-impl Color {
-    pub const BLACK: Self = Self::from_rgb(0, 255);
-    pub const WHITE: Self = Self::from_rgb(0xFFFFFF, 255);
-
-    /// Creates a `Color` from a 32-bit `rgb` value and an `alpha` value.
-    ///
-    /// The byte-ordering of the 32-bit `rgb` value is XXRRGGBB.
-    /// The most significant byte, represented by XX, is ignored;
-    /// the `alpha` value is provided separately.
-    /// This is followed by the the red (RR), green (GG), and blue (BB) components values,
-    /// respectively.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use swf::Color;
-    ///
-    /// let red = Color::from_rgb(0xFF0000, 255);
-    /// let green = Color::from_rgb(0x00FF00, 255);
-    /// let blue = Color::from_rgb(0x0000FF, 255);
-    /// ```
-    pub const fn from_rgb(rgb: u32, alpha: u8) -> Self {
-        let [b, g, r, _] = rgb.to_le_bytes();
-        Self { r, g, b, a: alpha }
-    }
-
-    /// Creates a `Color` from a 32-bit `rgba` value.
-    ///
-    /// The byte-ordering of the 32-bit `rgba` value is AARRGGBB.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use swf::Color;
-    ///
-    /// let red = Color::from_rgba(0xFFFF0000);
-    /// let green = Color::from_rgba(0xFF00FF00);
-    /// let blue = Color::from_rgba(0xFF0000FF);
-    /// ```
-    pub const fn from_rgba(rgba: u32) -> Self {
-        let [b, g, r, a] = rgba.to_le_bytes();
-        Self { r, g, b, a }
-    }
-
-    /// Converts the color to a 32-bit RGB value.
-    ///
-    /// The alpha value does not get stored.
-    ///
-    /// # Examples
-    ///
-    /// Basic usage:
-    /// ```rust
-    /// use swf::Color;
-    ///
-    /// let color = Color::from_rgb(0xFF00FF, 255);
-    /// assert_eq!(color.to_rgb(), 0xFF00FF);
-    /// ```
-    ///
-    /// Alpha values do not get stored:
-    /// ```rust
-    /// use swf::Color;
-    ///
-    /// let color1 = Color::from_rgb(0xFF00FF, 255);
-    /// let color2 = Color::from_rgb(0xFF00FF, 0);
-    /// assert_eq!(color1.to_rgb(), color2.to_rgb());
-    /// ```
-    pub const fn to_rgb(&self) -> u32 {
-        u32::from_le_bytes([self.b, self.g, self.r, 0])
-    }
-
-    /// Converts the color to a 32-bit RGBA value.
-    ///
-    /// # Examples
-    ///
-    /// Basic usage:
-    /// ```rust
-    /// use swf::Color;
-    ///
-    /// let color = Color::from_rgb(0xFF00FF, 255);
-    /// assert_eq!(color.to_rgba(), 0xFFFF00FF);
-    /// ```
-    pub const fn to_rgba(&self) -> u32 {
-        u32::from_le_bytes([self.b, self.g, self.r, self.a])
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -464,105 +366,15 @@ pub enum Filter {
     BlurFilter(Box<BlurFilter>),
     GlowFilter(Box<GlowFilter>),
     BevelFilter(Box<BevelFilter>),
-    GradientGlowFilter(Box<GradientGlowFilter>),
+    GradientGlowFilter(Box<GradientFilter>),
     ConvolutionFilter(Box<ConvolutionFilter>),
     ColorMatrixFilter(Box<ColorMatrixFilter>),
-    GradientBevelFilter(Box<GradientBevelFilter>),
+    GradientBevelFilter(Box<GradientFilter>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DropShadowFilter {
-    pub color: Color,
-    pub blur_x: Fixed16,
-    pub blur_y: Fixed16,
-    pub angle: Fixed16,
-    pub distance: Fixed16,
-    pub strength: Fixed8,
-    pub is_inner: bool,
-    pub is_knockout: bool,
-    pub num_passes: u8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlurFilter {
-    pub blur_x: Fixed16,
-    pub blur_y: Fixed16,
-    pub num_passes: u8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GlowFilter {
-    pub color: Color,
-    pub blur_x: Fixed16,
-    pub blur_y: Fixed16,
-    pub strength: Fixed8,
-    pub is_inner: bool,
-    pub is_knockout: bool,
-    pub num_passes: u8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BevelFilter {
-    pub shadow_color: Color,
-    pub highlight_color: Color,
-    pub blur_x: Fixed16,
-    pub blur_y: Fixed16,
-    pub angle: Fixed16,
-    pub distance: Fixed16,
-    pub strength: Fixed8,
-    pub is_inner: bool,
-    pub is_knockout: bool,
-    pub is_on_top: bool,
-    pub num_passes: u8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GradientGlowFilter {
-    pub colors: Vec<GradientRecord>,
-    pub blur_x: Fixed16,
-    pub blur_y: Fixed16,
-    pub angle: Fixed16,
-    pub distance: Fixed16,
-    pub strength: Fixed8,
-    pub is_inner: bool,
-    pub is_knockout: bool,
-    pub is_on_top: bool,
-    pub num_passes: u8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConvolutionFilter {
-    pub num_matrix_rows: u8,
-    pub num_matrix_cols: u8,
-    pub matrix: Vec<Fixed16>,
-    pub divisor: Fixed16,
-    pub bias: Fixed16,
-    pub default_color: Color,
-    pub is_clamped: bool,
-    pub is_preserve_alpha: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColorMatrixFilter {
-    pub matrix: [Fixed16; 20],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GradientBevelFilter {
-    pub colors: Vec<GradientRecord>,
-    pub blur_x: Fixed16,
-    pub blur_y: Fixed16,
-    pub angle: Fixed16,
-    pub distance: Fixed16,
-    pub strength: Fixed8,
-    pub is_inner: bool,
-    pub is_knockout: bool,
-    pub is_on_top: bool,
-    pub num_passes: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Eq, FromPrimitive, PartialEq, Enum)]
 pub enum BlendMode {
+    #[default]
     Normal = 0,
     Layer = 2,
     Multiply = 3,
@@ -588,9 +400,50 @@ impl BlendMode {
     }
 }
 
-impl Default for BlendMode {
-    fn default() -> Self {
-        BlendMode::Normal
+impl Display for BlendMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let s = match *self {
+            BlendMode::Normal => "normal",
+            BlendMode::Layer => "layer",
+            BlendMode::Multiply => "multiply",
+            BlendMode::Screen => "screen",
+            BlendMode::Lighten => "lighten",
+            BlendMode::Darken => "darken",
+            BlendMode::Difference => "difference",
+            BlendMode::Add => "add",
+            BlendMode::Subtract => "subtract",
+            BlendMode::Invert => "invert",
+            BlendMode::Alpha => "alpha",
+            BlendMode::Erase => "erase",
+            BlendMode::Overlay => "overlay",
+            BlendMode::HardLight => "hardlight",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for BlendMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mode = match s {
+            "normal" => BlendMode::Normal,
+            "layer" => BlendMode::Layer,
+            "multiply" => BlendMode::Multiply,
+            "screen" => BlendMode::Screen,
+            "lighten" => BlendMode::Lighten,
+            "darken" => BlendMode::Darken,
+            "difference" => BlendMode::Difference,
+            "add" => BlendMode::Add,
+            "subtract" => BlendMode::Subtract,
+            "invert" => BlendMode::Invert,
+            "alpha" => BlendMode::Alpha,
+            "erase" => BlendMode::Erase,
+            "overlay" => BlendMode::Overlay,
+            "hardlight" => BlendMode::HardLight,
+            _ => return Err(()),
+        };
+        Ok(mode)
     }
 }
 
@@ -692,7 +545,7 @@ pub enum Tag<'a> {
     DefineMorphShape(Box<DefineMorphShape>),
     DefineScalingGrid {
         id: CharacterId,
-        splitter_rect: Rectangle,
+        splitter_rect: Rectangle<Twips>,
     },
     DefineShape(Shape),
     DefineSound(Box<Sound<'a>>),
@@ -781,13 +634,19 @@ pub struct ShapeContext {
 pub struct Shape {
     pub version: u8,
     pub id: CharacterId,
-    pub shape_bounds: Rectangle,
-    pub edge_bounds: Rectangle,
-    pub has_fill_winding_rule: bool,
-    pub has_non_scaling_strokes: bool,
-    pub has_scaling_strokes: bool,
+    pub shape_bounds: Rectangle<Twips>,
+    pub edge_bounds: Rectangle<Twips>,
+    pub flags: ShapeFlag,
     pub styles: ShapeStyles,
     pub shape: Vec<ShapeRecord>,
+}
+
+bitflags! {
+    pub struct ShapeFlag: u8 {
+        const HAS_SCALING_STROKES     = 1 << 0;
+        const HAS_NON_SCALING_STROKES = 1 << 1;
+        const HAS_FILL_WINDING_RULE   = 1 << 2;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1122,8 +981,9 @@ impl Default for LineStyleFlag {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Eq, FromPrimitive, PartialEq)]
 pub enum LineCapStyle {
+    #[default]
     Round = 0,
     None = 1,
     Square = 2,
@@ -1136,25 +996,12 @@ impl LineCapStyle {
     }
 }
 
-impl Default for LineCapStyle {
-    #[inline]
-    fn default() -> Self {
-        Self::Round
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LineJoinStyle {
+    #[default]
     Round,
     Bevel,
     Miter(Fixed8),
-}
-
-impl Default for LineJoinStyle {
-    #[inline]
-    fn default() -> Self {
-        Self::Round
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq)]
@@ -1264,16 +1111,22 @@ bitflags! {
 pub struct DefineMorphShape {
     pub version: u8,
     pub id: CharacterId,
-    pub has_non_scaling_strokes: bool,
-    pub has_scaling_strokes: bool,
+    pub flags: DefineMorphShapeFlag,
     pub start: MorphShape,
     pub end: MorphShape,
 }
 
+bitflags! {
+    pub struct DefineMorphShapeFlag: u8 {
+        const HAS_SCALING_STROKES     = 1 << 0;
+        const HAS_NON_SCALING_STROKES = 1 << 1;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MorphShape {
-    pub shape_bounds: Rectangle,
-    pub edge_bounds: Rectangle,
+    pub shape_bounds: Rectangle<Twips>,
+    pub edge_bounds: Rectangle<Twips>,
     pub fill_styles: Vec<FillStyle>,
     pub line_styles: Vec<LineStyle>,
     pub shape: Vec<ShapeRecord>,
@@ -1323,7 +1176,7 @@ pub struct Glyph {
     pub shape_records: Vec<ShapeRecord>,
     pub code: u16,
     pub advance: i16,
-    pub bounds: Option<Rectangle>,
+    pub bounds: Option<Rectangle<Twips>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1371,7 +1224,7 @@ pub struct DefineBinaryData<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Text {
     pub id: CharacterId,
-    pub bounds: Rectangle,
+    pub bounds: Rectangle<Twips>,
     pub matrix: Matrix,
     pub records: Vec<TextRecord>,
 }
@@ -1394,29 +1247,339 @@ pub struct GlyphEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditText<'a> {
-    pub id: CharacterId,
-    pub bounds: Rectangle,
-    pub font_id: Option<CharacterId>, // TODO(Herschel): Combine with height
-    pub font_class_name: Option<&'a SwfStr>,
-    pub height: Option<Twips>,
-    pub color: Option<Color>,
-    pub max_length: Option<u16>,
-    pub layout: Option<TextLayout>,
-    pub variable_name: &'a SwfStr,
-    pub initial_text: Option<&'a SwfStr>,
-    pub is_word_wrap: bool,
-    pub is_multiline: bool,
-    pub is_password: bool,
-    pub is_read_only: bool,
-    pub is_auto_size: bool,
-    pub is_selectable: bool,
-    pub has_border: bool,
-    pub was_static: bool,
-    pub is_html: bool,
-    pub is_device_font: bool,
+    pub(crate) id: CharacterId,
+    pub(crate) bounds: Rectangle<Twips>,
+    pub(crate) font_id: CharacterId,
+    pub(crate) font_class: &'a SwfStr,
+    pub(crate) height: Twips,
+    pub(crate) color: Color,
+    pub(crate) max_length: u16,
+    pub(crate) layout: TextLayout,
+    pub(crate) variable_name: &'a SwfStr,
+    pub(crate) initial_text: &'a SwfStr,
+    pub(crate) flags: EditTextFlag,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl<'a> EditText<'a> {
+    #[inline]
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    #[inline]
+    pub fn bounds(&self) -> &Rectangle<Twips> {
+        &self.bounds
+    }
+
+    #[inline]
+    pub fn with_bounds(mut self, bounds: Rectangle<Twips>) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    #[inline]
+    pub fn id(&self) -> CharacterId {
+        self.id
+    }
+
+    #[inline]
+    pub fn with_id(mut self, id: CharacterId) -> Self {
+        self.id = id;
+        self
+    }
+
+    #[inline]
+    pub fn font_id(&self) -> Option<CharacterId> {
+        self.flags
+            .contains(EditTextFlag::HAS_FONT)
+            .then_some(self.font_id)
+    }
+
+    #[inline]
+    pub fn font_class(&self) -> Option<&'a SwfStr> {
+        self.flags
+            .contains(EditTextFlag::HAS_FONT_CLASS)
+            .then_some(self.font_class)
+    }
+
+    // The height of the font in twips.
+    #[inline]
+    pub fn height(&self) -> Option<Twips> {
+        self.flags
+            .intersects(EditTextFlag::HAS_FONT | EditTextFlag::HAS_FONT_CLASS)
+            .then_some(self.height)
+    }
+
+    #[inline]
+    pub fn with_default_font(mut self) -> Self {
+        self.flags -= EditTextFlag::HAS_FONT | EditTextFlag::HAS_FONT_CLASS;
+        self
+    }
+
+    #[inline]
+    pub fn with_font_id(mut self, font_id: CharacterId, height: Twips) -> Self {
+        self.flags |= EditTextFlag::HAS_FONT;
+        self.flags -= EditTextFlag::HAS_FONT_CLASS;
+        self.font_id = font_id;
+        self.height = height;
+        self
+    }
+
+    #[inline]
+    pub fn with_font_class(mut self, font_class: &'a SwfStr, height: Twips) -> Self {
+        self.flags |= EditTextFlag::HAS_FONT_CLASS;
+        self.flags -= EditTextFlag::HAS_FONT;
+        self.font_class = font_class;
+        self.height = height;
+        self
+    }
+
+    #[inline]
+    pub fn color(&self) -> Option<&Color> {
+        self.flags
+            .contains(EditTextFlag::HAS_TEXT_COLOR)
+            .then_some(&self.color)
+    }
+
+    #[inline]
+    pub fn with_color(mut self, color: Option<Color>) -> Self {
+        if let Some(color) = color {
+            self.flags |= EditTextFlag::HAS_TEXT_COLOR;
+            self.color = color;
+        } else {
+            self.flags -= EditTextFlag::HAS_TEXT_COLOR;
+        }
+        self
+    }
+
+    #[inline]
+    pub fn max_length(&self) -> Option<u16> {
+        self.flags
+            .contains(EditTextFlag::HAS_MAX_LENGTH)
+            .then_some(self.max_length)
+    }
+
+    #[inline]
+    pub fn with_max_length(mut self, max_length: Option<u16>) -> Self {
+        if let Some(max_length) = max_length {
+            self.flags |= EditTextFlag::HAS_MAX_LENGTH;
+            self.max_length = max_length;
+        } else {
+            self.flags -= EditTextFlag::HAS_MAX_LENGTH;
+        }
+        self
+    }
+
+    #[inline]
+    pub fn layout(&self) -> Option<&TextLayout> {
+        self.flags
+            .contains(EditTextFlag::HAS_LAYOUT)
+            .then_some(&self.layout)
+    }
+
+    #[inline]
+    pub fn with_layout(mut self, layout: Option<TextLayout>) -> Self {
+        if let Some(layout) = layout {
+            self.flags |= EditTextFlag::HAS_LAYOUT;
+            self.layout = layout;
+        } else {
+            self.flags -= EditTextFlag::HAS_LAYOUT;
+        }
+        self
+    }
+
+    #[inline]
+    pub fn variable_name(&self) -> &'a SwfStr {
+        self.variable_name
+    }
+
+    #[inline]
+    pub fn with_variable_name(mut self, variable_name: &'a SwfStr) -> Self {
+        self.variable_name = variable_name;
+        self
+    }
+
+    #[inline]
+    pub fn initial_text(&self) -> Option<&'a SwfStr> {
+        self.flags
+            .contains(EditTextFlag::HAS_TEXT)
+            .then_some(self.initial_text)
+    }
+
+    #[inline]
+    pub fn with_initial_text(mut self, initial_text: Option<&'a SwfStr>) -> Self {
+        if let Some(initial_text) = initial_text {
+            self.flags |= EditTextFlag::HAS_TEXT;
+            self.initial_text = initial_text;
+        } else {
+            self.flags -= EditTextFlag::HAS_TEXT;
+        }
+        self
+    }
+
+    #[inline]
+    pub fn flags(&self) -> EditTextFlag {
+        self.flags
+    }
+
+    #[inline]
+    pub fn is_auto_size(&self) -> bool {
+        self.flags.contains(EditTextFlag::AUTO_SIZE)
+    }
+
+    #[inline]
+    pub fn with_is_auto_size(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::AUTO_SIZE, value);
+        self
+    }
+
+    #[inline]
+    pub fn use_outlines(&self) -> bool {
+        self.flags.contains(EditTextFlag::USE_OUTLINES)
+    }
+
+    #[inline]
+    pub fn with_use_outlines(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::USE_OUTLINES, value);
+        self
+    }
+
+    #[inline]
+    pub fn has_border(&self) -> bool {
+        self.flags.contains(EditTextFlag::BORDER)
+    }
+
+    #[inline]
+    pub fn with_has_border(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::BORDER, value);
+        self
+    }
+
+    #[inline]
+    pub fn is_html(&self) -> bool {
+        self.flags.contains(EditTextFlag::HTML)
+    }
+
+    #[inline]
+    pub fn with_is_html(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::HTML, value);
+        self
+    }
+
+    #[inline]
+    pub fn is_multiline(&self) -> bool {
+        self.flags.contains(EditTextFlag::MULTILINE)
+    }
+
+    #[inline]
+    pub fn with_is_multiline(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::MULTILINE, value);
+        self
+    }
+
+    #[inline]
+    pub fn is_password(&self) -> bool {
+        self.flags.contains(EditTextFlag::PASSWORD)
+    }
+
+    #[inline]
+    pub fn with_is_password(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::PASSWORD, value);
+        self
+    }
+
+    #[inline]
+    pub fn is_read_only(&self) -> bool {
+        self.flags.contains(EditTextFlag::READ_ONLY)
+    }
+
+    #[inline]
+    pub fn with_is_read_only(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::READ_ONLY, value);
+        self
+    }
+
+    #[inline]
+    pub fn is_selectable(&self) -> bool {
+        !self.flags.contains(EditTextFlag::NO_SELECT)
+    }
+
+    #[inline]
+    pub fn with_is_selectable(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::NO_SELECT, !value);
+        self
+    }
+
+    #[inline]
+    pub fn was_static(&self) -> bool {
+        self.flags.contains(EditTextFlag::WAS_STATIC)
+    }
+
+    #[inline]
+    pub fn with_was_static(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::WAS_STATIC, value);
+        self
+    }
+
+    #[inline]
+    pub fn is_word_wrap(&self) -> bool {
+        self.flags.contains(EditTextFlag::WORD_WRAP)
+    }
+
+    #[inline]
+    pub fn with_is_word_wrap(mut self, value: bool) -> Self {
+        self.flags.set(EditTextFlag::WORD_WRAP, value);
+        self
+    }
+}
+
+impl<'a> Default for EditText<'a> {
+    fn default() -> Self {
+        Self {
+            id: Default::default(),
+            bounds: Default::default(),
+            font_id: Default::default(),
+            font_class: Default::default(),
+            height: Twips::ZERO,
+            color: Color::BLACK,
+            max_length: 0,
+            layout: TextLayout {
+                align: TextAlign::Left,
+                left_margin: Twips::ZERO,
+                right_margin: Twips::ZERO,
+                indent: Twips::ZERO,
+                leading: Twips::ZERO,
+            },
+            variable_name: Default::default(),
+            initial_text: Default::default(),
+            flags: EditTextFlag::empty(),
+        }
+    }
+}
+
+bitflags! {
+    pub struct EditTextFlag: u16 {
+        const HAS_FONT = 1 << 0;
+        const HAS_MAX_LENGTH = 1 << 1;
+        const HAS_TEXT_COLOR = 1 << 2;
+        const READ_ONLY = 1 << 3;
+        const PASSWORD = 1 << 4;
+        const MULTILINE = 1 << 5;
+        const WORD_WRAP = 1 << 6;
+        const HAS_TEXT = 1 << 7;
+
+        const USE_OUTLINES = 1 << 8;
+        const HTML = 1 << 9;
+        const WAS_STATIC = 1 << 10;
+        const BORDER = 1 << 11;
+        const NO_SELECT = 1 << 12;
+        const HAS_LAYOUT = 1 << 13;
+        const AUTO_SIZE = 1 << 14;
+        const HAS_FONT_CLASS = 1 << 15;
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TextLayout {
     pub align: TextAlign,
     pub left_margin: Twips,
@@ -1425,8 +1588,9 @@ pub struct TextLayout {
     pub leading: Twips,
 }
 
-#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, FromPrimitive, PartialEq)]
 pub enum TextAlign {
+    #[default]
     Left = 0,
     Right = 1,
     Center = 2,
@@ -1560,9 +1724,15 @@ pub struct DefineBitsJpeg3<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoAbc<'a> {
+    pub flags: DoAbcFlag,
     pub name: &'a SwfStr,
-    pub is_lazy_initialize: bool,
     pub data: &'a [u8],
+}
+
+bitflags! {
+    pub struct DoAbcFlag: u32 {
+        const LAZY_INITIALIZE = 1 << 0;
+    }
 }
 
 pub type DoAction<'a> = &'a [u8];
@@ -1571,7 +1741,7 @@ pub type JpegTables<'a> = &'a [u8];
 
 /// `ProductInfo` contains information about the software used to generate the SWF.
 /// Not documented in the SWF19 reference. Emitted by mxmlc.
-/// See http://wahlers.com.br/claus/blog/undocumented-swf-tags-written-by-mxmlc/
+/// See <http://wahlers.com.br/claus/blog/undocumented-swf-tags-written-by-mxmlc/>
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductInfo {
     pub product_id: u32,

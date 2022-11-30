@@ -1,3 +1,5 @@
+#![allow(clippy::bool_to_int_with_if)]
+
 #[macro_use]
 mod display_object;
 pub use display_object::StageDisplayState;
@@ -16,38 +18,40 @@ mod avm1;
 mod avm2;
 mod binary_data;
 pub mod bitmap;
-mod bounding_box;
 mod character;
-pub mod color_transform;
 pub mod context;
 pub mod context_menu;
 mod drawing;
 mod ecma_conversions;
+pub(crate) mod either;
 pub mod events;
 pub mod focus_tracker;
 mod font;
+mod frame_lifecycle;
 mod html;
 mod library;
+pub mod limits;
 pub mod loader;
 mod locale;
-pub mod matrix;
 mod player;
 mod prelude;
-pub mod shape_utils;
 pub mod string;
 pub mod tag_utils;
-mod transform;
+pub mod timer;
 mod types;
 mod vminterface;
 mod xml;
 
 pub mod backend;
 pub mod config;
+pub mod duration;
 pub mod external;
 
 pub use context_menu::ContextMenuItem;
 pub use events::PlayerEvent;
 pub use indexmap;
-pub use player::{Player, PlayerBuilder};
+pub use loader::LoadBehavior;
+pub use player::{Player, PlayerBuilder, StaticCallstack};
+pub use ruffle_render::backend::ViewportDimensions;
 pub use swf;
 pub use swf::Color;

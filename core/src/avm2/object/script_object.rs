@@ -1,11 +1,11 @@
 //! Default AVM2 object impl
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::Multiname;
 use crate::avm2::object::{ClassObject, FunctionObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::vtable::VTable;
-use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::{Error, QName};
 use crate::string::AvmString;
 use fnv::FnvHashMap;
 use gc_arena::{Collect, GcCell, MutationContext};
@@ -17,14 +17,14 @@ use std::fmt::Debug;
 pub fn scriptobject_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
+) -> Result<Object<'gc>, Error<'gc>> {
     let base = ScriptObjectData::new(class);
 
     Ok(ScriptObject(GcCell::allocate(activation.context.gc_context, base)).into())
 }
 
 /// Default implementation of `avm2::Object`.
-#[derive(Clone, Collect, Debug, Copy)]
+#[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
 pub struct ScriptObject<'gc>(GcCell<'gc, ScriptObjectData<'gc>>);
 
@@ -72,7 +72,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
     }
 }
@@ -101,6 +101,19 @@ impl<'gc> ScriptObject<'gc> {
             ScriptObjectData::custom_new(proto, class),
         ))
         .into()
+    }
+
+    /// A special case for `newcatch` implementation. Basically a variable (q)name
+    /// which maps to slot 1.
+    pub fn catch_scope(mc: MutationContext<'gc, '_>, qname: &QName<'gc>) -> Object<'gc> {
+        // TODO: use a proper ClassObject here; purposefully crafted bytecode
+        // can observe (the lack of) it.
+        let mut base = ScriptObjectData::custom_new(None, None);
+        let vt = VTable::newcatch(mc, &qname);
+        base.set_vtable(vt);
+        base.install_instance_slots();
+
+        ScriptObject(GcCell::allocate(mc, base)).into()
     }
 }
 
@@ -132,7 +145,7 @@ impl<'gc> ScriptObjectData<'gc> {
         &self,
         multiname: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         if !multiname.contains_public_namespace() {
             return Err(format!(
                 "Non-public property {} not found on Object",
@@ -153,11 +166,19 @@ impl<'gc> ScriptObjectData<'gc> {
         };
 
         let value = self.values.get(&local_name);
-
         if let Some(value) = value {
             return Ok(*value);
-        } else if let Some(proto) = self.proto() {
-            return proto.get_property_local(multiname, activation);
+        }
+
+        // follow the prototype chain
+        let mut proto = self.proto();
+        while let Some(obj) = proto {
+            let obj = obj.base();
+            let value = obj.values.get(&local_name);
+            if let Some(value) = value {
+                return Ok(*value);
+            }
+            proto = obj.proto();
         }
 
         // Special case: Unresolvable properties on dynamic classes are treated
@@ -168,7 +189,27 @@ impl<'gc> ScriptObjectData<'gc> {
             .map(|cls| cls.inner_class_definition().read().is_sealed())
             .unwrap_or(false)
         {
-            Err(format!("Cannot get undefined property {:?}", local_name).into())
+            let class_name = self
+                .instance_of()
+                .map(|cls| {
+                    cls.inner_class_definition()
+                        .read()
+                        .name()
+                        .to_qualified_name_err_message(activation.context.gc_context)
+                })
+                .unwrap_or_else(|| AvmString::from("<UNKNOWN>"));
+
+            let message = AvmString::new_utf8(activation.context.gc_context, &format!(
+                "Error #1069: Property {local_name} not found on {class_name} and there is no default value.",
+            ));
+            Err(Error::AvmError(
+                activation
+                    .avm2()
+                    .classes()
+                    .referenceerror
+                    .construct(activation, &[message.into(), 1069.into()])?
+                    .into(),
+            ))
         } else {
             Ok(Value::Undefined)
         }
@@ -179,15 +220,17 @@ impl<'gc> ScriptObjectData<'gc> {
         multiname: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         if self
             .instance_of()
             .map(|cls| cls.inner_class_definition().read().is_sealed())
             .unwrap_or(false)
         {
             return Err(format!(
-                "Cannot set undefined property {}",
-                multiname.to_qualified_name(activation.context.gc_context)
+                "Cannot set undefined property {} on {:?}",
+                multiname.to_qualified_name(activation.context.gc_context),
+                self.instance_of()
+                    .map(|cls| cls.inner_class_definition().read().name()),
             )
             .into());
         }
@@ -229,7 +272,7 @@ impl<'gc> ScriptObjectData<'gc> {
         multiname: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         self.set_property_local(multiname, value, activation)
     }
 
@@ -238,6 +281,7 @@ impl<'gc> ScriptObjectData<'gc> {
             return false;
         }
         if let Some(name) = multiname.local_name() {
+            self.set_local_property_is_enumerable(name, false);
             self.values.remove(&name);
             true
         } else {
@@ -245,11 +289,11 @@ impl<'gc> ScriptObjectData<'gc> {
         }
     }
 
-    pub fn get_slot(&self, id: u32) -> Result<Value<'gc>, Error> {
+    pub fn get_slot(&self, id: u32) -> Result<Value<'gc>, Error<'gc>> {
         self.slots
             .get(id as usize)
             .cloned()
-            .ok_or_else(|| format!("Slot index {} out of bounds!", id).into())
+            .ok_or_else(|| format!("Slot index {id} out of bounds!").into())
     }
 
     /// Set a slot by its index.
@@ -258,12 +302,12 @@ impl<'gc> ScriptObjectData<'gc> {
         id: u32,
         value: Value<'gc>,
         _mc: MutationContext<'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         if let Some(slot) = self.slots.get_mut(id as usize) {
             *slot = value;
             Ok(())
         } else {
-            Err(format!("Slot index {} out of bounds!", id).into())
+            Err(format!("Slot index {id} out of bounds!").into())
         }
     }
 
@@ -273,12 +317,12 @@ impl<'gc> ScriptObjectData<'gc> {
         id: u32,
         value: Value<'gc>,
         _mc: MutationContext<'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         if let Some(slot) = self.slots.get_mut(id as usize) {
             *slot = value;
             Ok(())
         } else {
-            Err(format!("Slot index {} out of bounds!", id).into())
+            Err(format!("Slot index {id} out of bounds!").into())
         }
     }
 
@@ -369,11 +413,7 @@ impl<'gc> ScriptObjectData<'gc> {
         self.enumerants.contains(&name)
     }
 
-    pub fn set_local_property_is_enumerable(
-        &mut self,
-        name: AvmString<'gc>,
-        is_enumerable: bool,
-    ) -> Result<(), Error> {
+    pub fn set_local_property_is_enumerable(&mut self, name: AvmString<'gc>, is_enumerable: bool) {
         if is_enumerable && self.values.contains_key(&name) && !self.enumerants.contains(&name) {
             self.enumerants.push(name);
         } else if !is_enumerable && self.enumerants.contains(&name) {
@@ -388,8 +428,6 @@ impl<'gc> ScriptObjectData<'gc> {
                 self.enumerants.remove(index);
             }
         }
-
-        Ok(())
     }
 
     /// Gets the number of (standard) enumerants.
@@ -425,5 +463,29 @@ impl<'gc> ScriptObjectData<'gc> {
 
     pub fn set_vtable(&mut self, vtable: VTable<'gc>) {
         self.vtable = Some(vtable);
+    }
+
+    pub fn debug_class_name(&self) -> Box<dyn std::fmt::Debug + 'gc> {
+        let class_name = self
+            .instance_of()
+            .map(|class_obj| class_obj.debug_class_name());
+
+        match class_name {
+            Some(class_name) => Box::new(class_name),
+            None => Box::new("<None>"),
+        }
+    }
+}
+
+impl<'gc> Debug for ScriptObject<'gc> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let mut f = f.debug_struct("ScriptObject");
+
+        match self.0.try_read() {
+            Ok(obj) => f.field("name", &obj.debug_class_name()),
+            Err(err) => f.field("name", &err),
+        };
+
+        f.field("ptr", &self.0.as_ptr()).finish()
     }
 }

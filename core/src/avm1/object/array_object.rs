@@ -1,6 +1,7 @@
 use crate::avm1::property::Attribute;
-use crate::avm1::{Activation, AvmString, Error, Object, ObjectPtr, ScriptObject, TObject, Value};
+use crate::avm1::{Activation, Error, Object, ObjectPtr, ScriptObject, TObject, Value};
 use crate::ecma_conversions::f64_to_wrapping_i32;
+use crate::string::AvmString;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::fmt;
 
@@ -40,7 +41,7 @@ impl<'gc> ArrayObject<'gc> {
         proto: Object<'gc>,
         elements: impl IntoIterator<Item = Value<'gc>>,
     ) -> Self {
-        let base = ScriptObject::object(gc_context, Some(proto));
+        let base = ScriptObject::new(gc_context, Some(proto));
         let mut length: i32 = 0;
         for value in elements.into_iter() {
             let length_str = AvmString::new_utf8(gc_context, length.to_string());

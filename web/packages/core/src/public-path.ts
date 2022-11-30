@@ -1,4 +1,4 @@
-import { Config } from "./config";
+import type { Config } from "./config";
 
 // This must be in global scope because `document.currentScript`
 // works only while the script is initially being processed.
@@ -44,7 +44,7 @@ try {
 export function publicPath(config: Config): string {
     // Default to the directory where this script resides.
     let path = currentScriptURL;
-    if (config !== undefined && config.publicPath !== undefined) {
+    if (config.publicPath !== null && config.publicPath !== undefined) {
         path = config.publicPath;
     }
 

@@ -1,8 +1,7 @@
 use crate::avm1::{Object as Avm1Object, TObject as Avm1TObject, Value as Avm1Value};
 use crate::avm2::{
-    Activation as Avm2Activation, Avm2, Error as Avm2Error, Event as Avm2Event,
-    EventData as Avm2EventData, Namespace as Avm2Namespace, Object as Avm2Object,
-    QName as Avm2QName, TObject as Avm2TObject, Value as Avm2Value,
+    Activation as Avm2Activation, Avm2, Error as Avm2Error, EventObject as Avm2EventObject,
+    Multiname as Avm2Multiname, Object as Avm2Object, TObject as Avm2TObject, Value as Avm2Value,
 };
 use crate::context::{RenderContext, UpdateContext};
 use crate::drawing::Drawing;
@@ -10,16 +9,16 @@ use crate::player::NEWEST_PLAYER_VERSION;
 use crate::prelude::*;
 use crate::string::{AvmString, WString};
 use crate::tag_utils::SwfMovie;
-use crate::transform::Transform;
 use crate::types::{Degrees, Percent};
-use crate::vminterface::{AvmType, Instantiator};
+use crate::vminterface::Instantiator;
 use bitflags::bitflags;
 use gc_arena::{Collect, MutationContext};
 use ruffle_macros::enum_trait_object;
+use ruffle_render::transform::Transform;
 use std::cell::{Ref, RefMut};
 use std::fmt::Debug;
 use std::sync::Arc;
-use swf::{BlendMode, Fixed8};
+use swf::{BlendMode, Fixed8, Rectangle};
 
 mod avm1_button;
 mod avm2_button;
@@ -28,24 +27,25 @@ mod container;
 mod edit_text;
 mod graphic;
 mod interactive;
+mod loader_display;
 mod morph_shape;
 mod movie_clip;
 mod stage;
 mod text;
 mod video;
 
-use crate::avm1::activation::Activation;
-pub use crate::display_object::container::{
-    DisplayObjectContainer, Lists, TDisplayObjectContainer,
-};
+use crate::avm1::Activation;
+pub use crate::display_object::container::{DisplayObjectContainer, TDisplayObjectContainer};
 pub use avm1_button::{Avm1Button, ButtonState, ButtonTracking};
 pub use avm2_button::Avm2Button;
 pub use bitmap::Bitmap;
 pub use edit_text::{AutoSizeMode, EditText, TextSelection};
 pub use graphic::Graphic;
 pub use interactive::{InteractiveObject, TInteractiveObject};
+pub use loader_display::LoaderDisplay;
 pub use morph_shape::{MorphShape, MorphShapeStatic};
 pub use movie_clip::{MovieClip, Scene};
+use ruffle_render::commands::CommandHandler;
 pub use stage::{Stage, StageAlign, StageDisplayState, StageQuality, StageScaleMode, WindowMode};
 pub use text::Text;
 pub use video::Video;
@@ -56,6 +56,7 @@ pub struct DisplayObjectBase<'gc> {
     parent: Option<DisplayObject<'gc>>,
     place_frame: u16,
     depth: Depth,
+    #[collect(require_static)]
     transform: Transform,
     name: AvmString<'gc>,
     clip_depth: Depth,
@@ -63,19 +64,14 @@ pub struct DisplayObjectBase<'gc> {
     // Cached transform properties `_xscale`, `_yscale`, `_rotation`.
     // These are expensive to calculate, so they will be calculated and cached
     // when AS requests one of these properties.
-    //
-    // `_xscale` and `_yscale` are stored in units of percentages to avoid
-    // floating-point precision errors with movies that accumulate onto the
-    // scale parameters.
+    #[collect(require_static)]
     rotation: Degrees,
+    #[collect(require_static)]
     scale_x: Percent,
+    #[collect(require_static)]
     scale_y: Percent,
-    skew: f64,
 
-    /// The previous display object in order of AVM1 execution.
-    ///
-    /// `None` in an AVM2 movie.
-    prev_avm1_clip: Option<DisplayObject<'gc>>,
+    skew: f64,
 
     /// The next display object in order of execution.
     ///
@@ -105,6 +101,17 @@ pub struct DisplayObjectBase<'gc> {
 
     /// Bit flags for various display object properties.
     flags: DisplayObjectFlags,
+
+    /// The 'internal' scroll rect used for rendering and methods like 'localToGlobal'.
+    /// This is updated from 'pre_render'
+    #[collect(require_static)]
+    scroll_rect: Option<Rectangle<Twips>>,
+
+    /// The 'next' scroll rect, which we will copy to 'scroll_rect' from 'pre_render'.
+    /// This is used by the ActionScript 'DisplayObject.scrollRect' getter, which sees
+    /// changes immediately (without needing wait for a render)
+    #[collect(require_static)]
+    next_scroll_rect: Rectangle<Twips>,
 }
 
 impl<'gc> Default for DisplayObjectBase<'gc> {
@@ -120,7 +127,6 @@ impl<'gc> Default for DisplayObjectBase<'gc> {
             scale_x: Percent::from_unit(1.0),
             scale_y: Percent::from_unit(1.0),
             skew: 0.0,
-            prev_avm1_clip: None,
             next_avm1_clip: None,
             masker: None,
             maskee: None,
@@ -128,20 +134,17 @@ impl<'gc> Default for DisplayObjectBase<'gc> {
             blend_mode: Default::default(),
             opaque_background: Default::default(),
             flags: DisplayObjectFlags::VISIBLE,
+            scroll_rect: None,
+            next_scroll_rect: Default::default(),
         }
     }
 }
 
-#[allow(dead_code)]
 impl<'gc> DisplayObjectBase<'gc> {
     /// Reset all properties that would be adjusted by a movie load.
     fn reset_for_movie_load(&mut self) {
         let flags_to_keep = self.flags & DisplayObjectFlags::LOCK_ROOT;
         self.flags = flags_to_keep | DisplayObjectFlags::VISIBLE;
-    }
-
-    fn id(&self) -> CharacterId {
-        0
     }
 
     fn depth(&self) -> Depth {
@@ -172,9 +175,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         &mut self.transform.matrix
     }
 
-    fn set_matrix(&mut self, matrix: &Matrix) {
-        self.transform.matrix = *matrix;
-        self.flags -= DisplayObjectFlags::SCALE_ROTATION_CACHED;
+    pub fn set_matrix(&mut self, matrix: Matrix) {
+        self.transform.matrix = matrix;
+        self.set_scale_rotation_cached(false);
     }
 
     pub fn color_transform(&self) -> &ColorTransform {
@@ -185,8 +188,8 @@ impl<'gc> DisplayObjectBase<'gc> {
         &mut self.transform.color_transform
     }
 
-    fn set_color_transform(&mut self, color_transform: &ColorTransform) {
-        self.transform.color_transform = *color_transform;
+    pub fn set_color_transform(&mut self, color_transform: ColorTransform) {
+        self.transform.color_transform = color_transform;
     }
 
     fn x(&self) -> f64 {
@@ -211,10 +214,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// Calculating these requires heavy trig ops, so we only do it when `_xscale`, `_yscale` or
     /// `_rotation` is accessed.
     fn cache_scale_rotation(&mut self) {
-        if !self
-            .flags
-            .contains(DisplayObjectFlags::SCALE_ROTATION_CACHED)
-        {
+        if !self.scale_rotation_cached() {
             let (a, b, c, d) = (
                 f64::from(self.transform.matrix.a),
                 f64::from(self.transform.matrix.b),
@@ -243,23 +243,7 @@ impl<'gc> DisplayObjectBase<'gc> {
             self.scale_x = Percent::from_unit(scale_x);
             self.scale_y = Percent::from_unit(scale_y);
             self.skew = rotation_y - rotation_x;
-            self.flags |= DisplayObjectFlags::SCALE_ROTATION_CACHED;
         }
-    }
-
-    fn set_scale(&mut self, scale_x: f32, scale_y: f32, rotation: f32) {
-        self.cache_scale_rotation();
-        let mut matrix = &mut self.transform.matrix;
-        let rotation = rotation.to_radians();
-        let cos_x = f32::cos(rotation);
-        let sin_x = f32::sin(rotation);
-        self.scale_x = Percent::from_unit(scale_x.into());
-        self.scale_y = Percent::from_unit(scale_y.into());
-        self.rotation = Degrees::from_radians(rotation.into());
-        matrix.a = (scale_x * cos_x) as f32;
-        matrix.b = (scale_x * sin_x) as f32;
-        matrix.c = (scale_y * -sin_x) as f32;
-        matrix.d = (scale_y * cos_x) as f32;
     }
 
     fn rotation(&mut self) -> Degrees {
@@ -276,10 +260,10 @@ impl<'gc> DisplayObjectBase<'gc> {
         let cos_y = f64::cos(degrees.into_radians() + self.skew);
         let sin_y = f64::sin(degrees.into_radians() + self.skew);
         let mut matrix = &mut self.transform.matrix;
-        matrix.a = (self.scale_x.into_unit() * cos_x) as f32;
-        matrix.b = (self.scale_x.into_unit() * sin_x) as f32;
-        matrix.c = (self.scale_y.into_unit() * -sin_y) as f32;
-        matrix.d = (self.scale_y.into_unit() * cos_y) as f32;
+        matrix.a = (self.scale_x.unit() * cos_x) as f32;
+        matrix.b = (self.scale_x.unit() * sin_x) as f32;
+        matrix.c = (self.scale_y.unit() * -sin_y) as f32;
+        matrix.d = (self.scale_y.unit() * cos_y) as f32;
     }
 
     fn scale_x(&mut self) -> Percent {
@@ -294,8 +278,8 @@ impl<'gc> DisplayObjectBase<'gc> {
         let cos = f64::cos(self.rotation.into_radians());
         let sin = f64::sin(self.rotation.into_radians());
         let mut matrix = &mut self.transform.matrix;
-        matrix.a = (cos * value.into_unit()) as f32;
-        matrix.b = (sin * value.into_unit()) as f32;
+        matrix.a = (cos * value.unit()) as f32;
+        matrix.b = (sin * value.unit()) as f32;
     }
 
     fn scale_y(&mut self) -> Percent {
@@ -310,8 +294,8 @@ impl<'gc> DisplayObjectBase<'gc> {
         let cos = f64::cos(self.rotation.into_radians() + self.skew);
         let sin = f64::sin(self.rotation.into_radians() + self.skew);
         let mut matrix = &mut self.transform.matrix;
-        matrix.c = (-sin * value.into_unit()) as f32;
-        matrix.d = (cos * value.into_unit()) as f32;
+        matrix.c = (-sin * value.unit()) as f32;
+        matrix.d = (cos * value.unit()) as f32;
     }
 
     fn name(&self) -> AvmString<'gc> {
@@ -347,14 +331,6 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.parent = parent;
     }
 
-    fn prev_avm1_clip(&self) -> Option<DisplayObject<'gc>> {
-        self.prev_avm1_clip
-    }
-
-    fn set_prev_avm1_clip(&mut self, node: Option<DisplayObject<'gc>>) {
-        self.prev_avm1_clip = node;
-    }
-
     fn next_avm1_clip(&self) -> Option<DisplayObject<'gc>> {
         self.next_avm1_clip
     }
@@ -369,6 +345,19 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_removed(&mut self, value: bool) {
         self.flags.set(DisplayObjectFlags::REMOVED, value);
+    }
+
+    fn scale_rotation_cached(&self) -> bool {
+        self.flags
+            .contains(DisplayObjectFlags::SCALE_ROTATION_CACHED)
+    }
+
+    fn set_scale_rotation_cached(&mut self, set_flag: bool) {
+        if set_flag {
+            self.flags |= DisplayObjectFlags::SCALE_ROTATION_CACHED;
+        } else {
+            self.flags -= DisplayObjectFlags::SCALE_ROTATION_CACHED;
+        }
     }
 
     pub fn sound_transform(&self) -> &SoundTransform {
@@ -392,6 +381,12 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_blend_mode(&mut self, value: BlendMode) {
+        if value != BlendMode::Normal {
+            log::warn!(
+                "Blend mode '{}' is unsupported and will not render correctly.",
+                value
+            );
+        }
         self.blend_mode = value;
     }
 
@@ -464,19 +459,18 @@ impl<'gc> DisplayObjectBase<'gc> {
             .set(DisplayObjectFlags::INSTANTIATED_BY_TIMELINE, value);
     }
 
-    fn swf_version(&self) -> u8 {
-        self.parent
-            .map(|p| p.swf_version())
-            .unwrap_or(NEWEST_PLAYER_VERSION)
+    fn has_scroll_rect(&self) -> bool {
+        self.flags.contains(DisplayObjectFlags::HAS_SCROLL_RECT)
     }
 
-    fn movie(&self) -> Option<Arc<SwfMovie>> {
-        self.parent.and_then(|p| p.movie())
+    fn set_has_scroll_rect(&mut self, value: bool) {
+        self.flags.set(DisplayObjectFlags::HAS_SCROLL_RECT, value);
     }
 
     fn masker(&self) -> Option<DisplayObject<'gc>> {
         self.masker
     }
+
     fn set_masker(&mut self, node: Option<DisplayObject<'gc>>) {
         self.masker = node;
     }
@@ -484,39 +478,103 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn maskee(&self) -> Option<DisplayObject<'gc>> {
         self.maskee
     }
+
     fn set_maskee(&mut self, node: Option<DisplayObject<'gc>>) {
         self.maskee = node;
     }
 }
 
-pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_, 'gc>) {
+pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_, 'gc, '_>) {
     if this.maskee().is_some() {
         return;
     }
     context.transform_stack.push(this.base().transform());
+    let blend_mode = this.blend_mode();
+    if blend_mode != BlendMode::Normal {
+        context.commands.push_blend_mode(this.blend_mode());
+    }
+
+    let scroll_rect_matrix = if let Some(rect) = this.scroll_rect() {
+        let cur_transform = context.transform_stack.transform();
+        // The matrix we use for actually drawing a rectangle for cropping purposes
+        // Note that we do *not* apply the translation yet
+        Some(
+            cur_transform.matrix
+                * Matrix::scale(
+                    rect.width().to_pixels() as f32,
+                    rect.height().to_pixels() as f32,
+                ),
+        )
+    } else {
+        None
+    };
+
+    if let Some(rect) = this.scroll_rect() {
+        // Translate everything that we render (including DisplayObject.mask)
+        context.transform_stack.push(&Transform {
+            matrix: Matrix::translate(-rect.x_min, -rect.y_min),
+            color_transform: Default::default(),
+        });
+    }
 
     let mask = this.masker();
-    let mut mask_transform = crate::transform::Transform::default();
+    let mut mask_transform = ruffle_render::transform::Transform::default();
     if let Some(m) = mask {
         mask_transform.matrix = this.global_to_local_matrix();
         mask_transform.matrix *= m.local_to_global_matrix();
-        context.renderer.push_mask();
+        context.commands.push_mask();
         context.allow_mask = false;
         context.transform_stack.push(&mask_transform);
         m.render_self(context);
         context.transform_stack.pop();
         context.allow_mask = true;
-        context.renderer.activate_mask();
+        context.commands.activate_mask();
     }
+
+    // There are two parts to 'DisplayObject.scrollRect':
+    // a scroll effect (translation), and a crop effect.
+    // This scroll is implementing by appling a translation matrix
+    // when we defined 'scroll_rect_matrix'.
+    // The crop is implemented as a rectangular mask using the height
+    // and width provided by 'scrollRect'.
+
+    // Note that this mask is applied *in additon to* a mask defined
+    // with 'DisplayObject.mask'. We will end up rendering content that
+    // lies in the intersection of the scroll rect and DisplayObject.mask,
+    // which is exactly the behavior that we want.
+    if let Some(rect_mat) = scroll_rect_matrix {
+        context.commands.push_mask();
+        // The color doesn't matter, as this is a mask.
+        context.commands.draw_rect(Color::BLACK, &rect_mat);
+        context.commands.activate_mask();
+    }
+
     this.render_self(context);
+
+    if let Some(rect_mat) = scroll_rect_matrix {
+        // Draw the rectangle again after deactivating the mask,
+        // to reset the stencil buffer.
+        context.commands.deactivate_mask();
+        context.commands.draw_rect(Color::BLACK, &rect_mat);
+        context.commands.pop_mask();
+    }
+
     if let Some(m) = mask {
-        context.renderer.deactivate_mask();
+        context.commands.deactivate_mask();
         context.allow_mask = false;
         context.transform_stack.push(&mask_transform);
         m.render_self(context);
         context.transform_stack.pop();
         context.allow_mask = true;
-        context.renderer.pop_mask();
+        context.commands.pop_mask();
+    }
+    if blend_mode != BlendMode::Normal {
+        context.commands.pop_blend_mode();
+    }
+
+    if scroll_rect_matrix.is_some() {
+        // Remove the translation that we pushed
+        context.transform_stack.pop();
     }
 
     context.transform_stack.pop();
@@ -536,6 +594,7 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
         MovieClip(MovieClip<'gc>),
         Text(Text<'gc>),
         Video(Video<'gc>),
+        LoaderDisplay(LoaderDisplay<'gc>)
     }
 )]
 pub trait TDisplayObject<'gc>:
@@ -543,6 +602,14 @@ pub trait TDisplayObject<'gc>:
 {
     fn base<'a>(&'a self) -> Ref<'a, DisplayObjectBase<'gc>>;
     fn base_mut<'a>(&'a self, mc: MutationContext<'gc, '_>) -> RefMut<'a, DisplayObjectBase<'gc>>;
+
+    /// The `SCALE_ROTATION_CACHED` flag should only be set in SWFv5+.
+    /// So scaling/rotation values always have to get recalculated from the matrix in SWFv4.
+    fn set_scale_rotation_cached(&self, gc_context: MutationContext<'gc, '_>) {
+        if self.swf_version() >= 5 {
+            self.base_mut(gc_context).set_scale_rotation_cached(true);
+        }
+    }
 
     fn id(&self) -> CharacterId;
     fn depth(&self) -> Depth {
@@ -582,6 +649,19 @@ pub trait TDisplayObject<'gc>:
     /// it to the bounding box. This gives a tighter AABB then if we simply transformed
     /// the overall AABB.
     fn bounds_with_transform(&self, matrix: &Matrix) -> BoundingBox {
+        // A scroll rect completely overrides an object's bounds,
+        // and can even the bounding box to be larger than the actual content
+        if let Some(scroll_rect) = self.scroll_rect() {
+            return BoundingBox {
+                x_min: Twips::from_pixels(0.0),
+                y_min: Twips::from_pixels(0.0),
+                x_max: scroll_rect.width(),
+                y_max: scroll_rect.height(),
+                valid: true,
+            }
+            .transform(matrix);
+        }
+
         let mut bounds = self.self_bounds().transform(matrix);
 
         if let Some(ctr) = self.as_container() {
@@ -601,21 +681,21 @@ pub trait TDisplayObject<'gc>:
         self.base_mut(gc_context).set_place_frame(frame)
     }
 
-    fn set_matrix(&self, gc_context: MutationContext<'gc, '_>, matrix: &Matrix) {
+    fn set_matrix(&self, gc_context: MutationContext<'gc, '_>, matrix: Matrix) {
         self.base_mut(gc_context).set_matrix(matrix);
     }
 
     fn set_color_transform(
         &self,
         gc_context: MutationContext<'gc, '_>,
-        color_transform: &ColorTransform,
+        color_transform: ColorTransform,
     ) {
         self.base_mut(gc_context)
             .set_color_transform(color_transform)
     }
 
-    /// Returns the matrix for transforming from this object's local space to global stage space.
-    fn local_to_global_matrix(&self) -> Matrix {
+    /// Should only be used to implement 'Transform.concatenatedMatrix'
+    fn local_to_global_matrix_without_own_scroll_rect(&self) -> Matrix {
         let mut node = self.parent();
         let mut matrix = *self.base().matrix();
         while let Some(display_object) = node {
@@ -628,10 +708,22 @@ pub trait TDisplayObject<'gc>:
             if display_object.as_stage().is_some() {
                 break;
             }
+            if let Some(rect) = display_object.scroll_rect() {
+                matrix = Matrix::translate(-rect.x_min, -rect.y_min) * matrix;
+            }
             matrix = *display_object.base().matrix() * matrix;
             node = display_object.parent();
         }
         matrix
+    }
+
+    /// Returns the matrix for transforming from this object's local space to global stage space.
+    fn local_to_global_matrix(&self) -> Matrix {
+        let mut matrix = Matrix::IDENTITY;
+        if let Some(rect) = self.scroll_rect() {
+            matrix = Matrix::translate(-rect.x_min, -rect.y_min) * matrix;
+        }
+        self.local_to_global_matrix_without_own_scroll_rect() * matrix
     }
 
     /// Returns the matrix for transforming from global stage to this object's local space.
@@ -678,49 +770,52 @@ pub trait TDisplayObject<'gc>:
     /// The rotation in degrees this display object in local space.
     /// Returned by the `_rotation`/`rotation` ActionScript properties.
     fn rotation(&self, gc_context: MutationContext<'gc, '_>) -> Degrees {
-        self.base_mut(gc_context).rotation()
+        let degrees = self.base_mut(gc_context).rotation();
+        self.set_scale_rotation_cached(gc_context);
+        degrees
     }
 
     /// Sets the rotation in degrees this display object in local space.
     /// Set by the `_rotation`/`rotation` ActionScript properties.
     fn set_rotation(&self, gc_context: MutationContext<'gc, '_>, radians: Degrees) {
         self.base_mut(gc_context).set_rotation(radians);
+        self.set_scale_rotation_cached(gc_context);
     }
 
     /// The X axis scale for this display object in local space.
-    /// The normal scale is 100.
     /// Returned by the `_xscale`/`scaleX` ActionScript properties.
     fn scale_x(&self, gc_context: MutationContext<'gc, '_>) -> Percent {
-        self.base_mut(gc_context).scale_x()
+        let percent = self.base_mut(gc_context).scale_x();
+        self.set_scale_rotation_cached(gc_context);
+        percent
     }
 
-    /// Sets the scale of the X axis for this display object in local space.
-    /// The normal scale is 100.
+    /// Sets the X axis scale for this display object in local space.
     /// Set by the `_xscale`/`scaleX` ActionScript properties.
     fn set_scale_x(&self, gc_context: MutationContext<'gc, '_>, value: Percent) {
         self.base_mut(gc_context).set_scale_x(value);
+        self.set_scale_rotation_cached(gc_context);
     }
 
     /// The Y axis scale for this display object in local space.
-    /// The normal scale is 1.
     /// Returned by the `_yscale`/`scaleY` ActionScript properties.
     fn scale_y(&self, gc_context: MutationContext<'gc, '_>) -> Percent {
-        self.base_mut(gc_context).scale_y()
+        let percent = self.base_mut(gc_context).scale_y();
+        self.set_scale_rotation_cached(gc_context);
+        percent
     }
 
     /// Sets the Y axis scale for this display object in local space.
-    /// The normal scale is 1.
     /// Returned by the `_yscale`/`scaleY` ActionScript properties.
     fn set_scale_y(&self, gc_context: MutationContext<'gc, '_>, value: Percent) {
         self.base_mut(gc_context).set_scale_y(value);
+        self.set_scale_rotation_cached(gc_context);
     }
 
-    /// Sets the pixel width of this display object in local space.
-    /// The width is based on the AABB of the object.
+    /// Gets the pixel width of the AABB containing this display object in local space.
     /// Returned by the ActionScript `_width`/`width` properties.
     fn width(&self) -> f64 {
-        let bounds = self.local_bounds();
-        (bounds.x_max.saturating_sub(bounds.x_min)).to_pixels()
+        self.local_bounds().width().to_pixels()
     }
 
     /// Sets the pixel width of this display object in local space.
@@ -729,8 +824,8 @@ pub trait TDisplayObject<'gc>:
     /// This does odd things on rotated clips to match the behavior of Flash.
     fn set_width(&self, gc_context: MutationContext<'gc, '_>, value: f64) {
         let object_bounds = self.bounds();
-        let object_width = (object_bounds.x_max - object_bounds.x_min).to_pixels();
-        let object_height = (object_bounds.y_max - object_bounds.y_min).to_pixels();
+        let object_width = object_bounds.width().to_pixels();
+        let object_height = object_bounds.height().to_pixels();
         let aspect_ratio = object_height / object_width;
 
         let (target_scale_x, target_scale_y) = if object_width != 0.0 {
@@ -743,8 +838,8 @@ pub trait TDisplayObject<'gc>:
         // It has to do with the length of the sides A, B of an AABB enclosing the object's OBB with sides a, b:
         // A = sin(t) * a + cos(t) * b
         // B = cos(t) * a + sin(t) * b
-        let prev_scale_x = self.scale_x(gc_context).into_unit();
-        let prev_scale_y = self.scale_y(gc_context).into_unit();
+        let prev_scale_x = self.scale_x(gc_context).unit();
+        let prev_scale_y = self.scale_y(gc_context).unit();
         let rotation = self.rotation(gc_context);
         let cos = f64::abs(f64::cos(rotation.into_radians()));
         let sin = f64::abs(f64::sin(rotation.into_radians()));
@@ -768,8 +863,7 @@ pub trait TDisplayObject<'gc>:
     /// Gets the pixel height of the AABB containing this display object in local space.
     /// Returned by the ActionScript `_height`/`height` properties.
     fn height(&self) -> f64 {
-        let bounds = self.local_bounds();
-        (bounds.y_max.saturating_sub(bounds.y_min)).to_pixels()
+        self.local_bounds().height().to_pixels()
     }
 
     /// Sets the pixel height of this display object in local space.
@@ -777,8 +871,8 @@ pub trait TDisplayObject<'gc>:
     /// This does odd things on rotated clips to match the behavior of Flash.
     fn set_height(&self, gc_context: MutationContext<'gc, '_>, value: f64) {
         let object_bounds = self.bounds();
-        let object_width = (object_bounds.x_max - object_bounds.x_min).to_pixels();
-        let object_height = (object_bounds.y_max - object_bounds.y_min).to_pixels();
+        let object_width = object_bounds.width().to_pixels();
+        let object_height = object_bounds.height().to_pixels();
         let aspect_ratio = object_width / object_height;
 
         let (target_scale_x, target_scale_y) = if object_height != 0.0 {
@@ -791,8 +885,8 @@ pub trait TDisplayObject<'gc>:
         // It has to do with the length of the sides A, B of an AABB enclosing the object's OBB with sides a, b:
         // A = sin(t) * a + cos(t) * b
         // B = cos(t) * a + sin(t) * b
-        let prev_scale_x = self.scale_x(gc_context).into_unit();
-        let prev_scale_y = self.scale_y(gc_context).into_unit();
+        let prev_scale_x = self.scale_x(gc_context).unit();
+        let prev_scale_y = self.scale_y(gc_context).unit();
         let rotation = self.rotation(gc_context);
         let cos = f64::abs(f64::cos(rotation.into_radians()));
         let sin = f64::abs(f64::sin(rotation.into_radians()));
@@ -862,7 +956,7 @@ pub trait TDisplayObject<'gc>:
                     WString::new()
                 } else {
                     // Other levels do append their name.
-                    WString::from_utf8_owned(format!("_level{}", level))
+                    WString::from_utf8_owned(format!("_level{level}"))
                 }
             }
         }
@@ -912,16 +1006,6 @@ pub trait TDisplayObject<'gc>:
         self.parent().filter(|p| p.as_container().is_some())
     }
 
-    fn prev_avm1_clip(&self) -> Option<DisplayObject<'gc>> {
-        self.base().prev_avm1_clip()
-    }
-    fn set_prev_avm1_clip(
-        &self,
-        gc_context: MutationContext<'gc, '_>,
-        node: Option<DisplayObject<'gc>>,
-    ) {
-        self.base_mut(gc_context).set_prev_avm1_clip(node);
-    }
     fn next_avm1_clip(&self) -> Option<DisplayObject<'gc>> {
         self.base().next_avm1_clip()
     }
@@ -965,6 +1049,22 @@ pub trait TDisplayObject<'gc>:
         self.base_mut(gc_context).set_maskee(node);
     }
 
+    fn scroll_rect(&self) -> Option<Rectangle<Twips>> {
+        self.base().scroll_rect.clone()
+    }
+
+    fn next_scroll_rect(&self) -> Rectangle<Twips> {
+        self.base().next_scroll_rect.clone()
+    }
+
+    fn set_next_scroll_rect(
+        &self,
+        gc_context: MutationContext<'gc, '_>,
+        rectangle: Rectangle<Twips>,
+    ) {
+        self.base_mut(gc_context).next_scroll_rect = rectangle;
+    }
+
     fn removed(&self) -> bool {
         self.base().removed()
     }
@@ -994,7 +1094,7 @@ pub trait TDisplayObject<'gc>:
 
     /// Sets the blend mode used when rendering this display object.
     /// Values other than the defualt `BlendMode::Normal` implicitly cause cache-as-bitmap behavior.
-    fn set_blend_mode(&mut self, gc_context: MutationContext<'gc, '_>, value: BlendMode) {
+    fn set_blend_mode(&self, gc_context: MutationContext<'gc, '_>, value: BlendMode) {
         self.base_mut(gc_context).set_blend_mode(value);
     }
 
@@ -1069,6 +1169,16 @@ pub trait TDisplayObject<'gc>:
         self.base_mut(gc_context).set_is_bitmap_cached(value)
     }
 
+    /// Whether this display object has a scroll rectangle applied.
+    fn has_scroll_rect(&self) -> bool {
+        self.base().has_scroll_rect()
+    }
+
+    /// Sets whether this display object has a scroll rectangle applied.
+    fn set_has_scroll_rect(&self, gc_context: MutationContext<'gc, '_>, value: bool) {
+        self.base_mut(gc_context).set_has_scroll_rect(value)
+    }
+
     /// Called whenever the focus tracker has deemed this display object worthy, or no longer worthy,
     /// of being the currently focused object.
     /// This should only be called by the focus manager. To change a focus, go through that.
@@ -1108,22 +1218,10 @@ pub trait TDisplayObject<'gc>:
             .set_instantiated_by_timeline(value);
     }
 
-    /// Emit an `enterFrame` event on this DisplayObject and any children it
-    /// may have.
-    fn enter_frame(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
-        let mut enter_frame_evt = Avm2Event::new("enterFrame", Avm2EventData::Empty);
-        enter_frame_evt.set_bubbles(false);
-        enter_frame_evt.set_cancelable(false);
-
-        let dobject_constr = context.avm2.classes().display_object;
-
-        if let Err(e) = Avm2::broadcast_event(context, enter_frame_evt, dobject_constr) {
-            log::error!(
-                "Encountered AVM2 error when broadcasting enterFrame event: {}",
-                e
-            );
-        }
-    }
+    /// Run any start-of-frame actions for this display object.
+    ///
+    /// When fired on `Stage`, this also emits the AVM2 `enterFrame` broadcast.
+    fn enter_frame(&self, _context: &mut UpdateContext<'_, 'gc, '_>) {}
 
     /// Construct all display objects that the timeline indicates should exist
     /// this frame, and their children.
@@ -1157,9 +1255,8 @@ pub trait TDisplayObject<'gc>:
     /// Emit a `frameConstructed` event on this DisplayObject and any children it
     /// may have.
     fn frame_constructed(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
-        let mut frame_constructed_evt = Avm2Event::new("frameConstructed", Avm2EventData::Empty);
-        frame_constructed_evt.set_bubbles(false);
-        frame_constructed_evt.set_cancelable(false);
+        let frame_constructed_evt =
+            Avm2EventObject::bare_default_event(context, "frameConstructed");
 
         let dobject_constr = context.avm2.classes().display_object;
 
@@ -1182,9 +1279,7 @@ pub trait TDisplayObject<'gc>:
 
     /// Emit an `exitFrame` broadcast event.
     fn exit_frame(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
-        let mut exit_frame_evt = Avm2Event::new("exitFrame", Avm2EventData::Empty);
-        exit_frame_evt.set_bubbles(false);
-        exit_frame_evt.set_cancelable(false);
+        let exit_frame_evt = Avm2EventObject::bare_default_event(context, "exitFrame");
 
         let dobject_constr = context.avm2.classes().display_object;
 
@@ -1194,11 +1289,31 @@ pub trait TDisplayObject<'gc>:
                 e
             );
         }
+
+        self.on_exit_frame(context);
     }
 
-    fn render_self(&self, _context: &mut RenderContext<'_, 'gc>) {}
+    fn on_exit_frame(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
+        if let Some(container) = self.as_container() {
+            for child in container.iter_render_list() {
+                child.on_exit_frame(context);
+            }
+        }
+    }
 
-    fn render(&self, context: &mut RenderContext<'_, 'gc>) {
+    /// Called before the child is about to be rendered.
+    /// Note that this happens even if the child is invisible
+    /// (as long as the child is still on a render list)
+    fn pre_render(&self, context: &mut RenderContext<'_, 'gc, '_>) {
+        let mut this = self.base_mut(context.gc_context);
+        this.scroll_rect = this
+            .has_scroll_rect()
+            .then(|| this.next_scroll_rect.clone());
+    }
+
+    fn render_self(&self, _context: &mut RenderContext<'_, 'gc, '_>) {}
+
+    fn render(&self, context: &mut RenderContext<'_, 'gc, '_>) {
         render_base((*self).into(), context)
     }
 
@@ -1268,10 +1383,10 @@ pub trait TDisplayObject<'gc>:
         // PlaceObject tags only apply if this object has not been dynamically moved by AS code.
         if !self.transformed_by_script() {
             if let Some(matrix) = place_object.matrix {
-                self.set_matrix(context.gc_context, &matrix.into());
+                self.set_matrix(context.gc_context, matrix.into());
             }
             if let Some(color_transform) = &place_object.color_transform {
-                self.set_color_transform(context.gc_context, &color_transform.clone().into());
+                self.set_color_transform(context.gc_context, color_transform.clone().into());
             }
             if let Some(ratio) = place_object.ratio {
                 if let Some(mut morph_shape) = self.as_morph_shape() {
@@ -1282,6 +1397,9 @@ pub trait TDisplayObject<'gc>:
             }
             if let Some(is_bitmap_cached) = place_object.is_bitmap_cached {
                 self.set_is_bitmap_cached(context.gc_context, is_bitmap_cached);
+            }
+            if let Some(blend_mode) = place_object.blend_mode {
+                self.set_blend_mode(context.gc_context, blend_mode);
             }
             if self.swf_version() >= 11 {
                 if let Some(visible) = place_object.is_visible {
@@ -1365,6 +1483,10 @@ pub trait TDisplayObject<'gc>:
     /// Return the SWF that defines this display object.
     fn movie(&self) -> Option<Arc<SwfMovie>> {
         self.parent().and_then(|p| p.movie())
+    }
+
+    fn loader_info(&self) -> Option<Avm2Object<'gc>> {
+        None
     }
 
     fn instantiate(&self, gc_context: MutationContext<'gc, '_>) -> DisplayObject<'gc>;
@@ -1461,12 +1583,10 @@ pub trait TDisplayObject<'gc>:
     /// The default root names change based on the AVM configuration of the
     /// clip; AVM2 clips get `rootN` while AVM1 clips get blank strings.
     fn set_default_root_name(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
-        let vm_type = context.avm_type();
-
-        if matches!(vm_type, AvmType::Avm2) {
+        if context.is_action_script_3() {
             let name = AvmString::new_utf8(context.gc_context, format!("root{}", self.depth() + 1));
             self.set_name(context.gc_context, name);
-        } else if matches!(vm_type, AvmType::Avm1) {
+        } else {
             self.set_name(context.gc_context, Default::default());
         }
     }
@@ -1525,7 +1645,7 @@ bitflags! {
         const PLACED_BY_SCRIPT         = 1 << 4;
 
         /// Whether this object has been instantiated by a SWF tag.
-        /// When this flag is set, changes from SWF `RemoveObject` tags are ignored.
+        /// When this flag is set, attempts to change the object's name from AVM2 throw an exception.
         const INSTANTIATED_BY_TIMELINE = 1 << 5;
 
         /// Whether this object is a "root", the top-most display object of a loaded SWF or Bitmap.
@@ -1538,6 +1658,9 @@ bitflags! {
 
         /// Whether this object will be cached to bitmap.
         const CACHE_AS_BITMAP          = 1 << 8;
+
+        /// Whether this object has a scroll rectangle applied.
+        const HAS_SCROLL_RECT          = 1 << 9;
     }
 }
 
@@ -1634,41 +1757,26 @@ impl SoundTransform {
     pub fn from_avm2_object<'gc>(
         activation: &mut Avm2Activation<'_, 'gc, '_>,
         as3_st: Avm2Object<'gc>,
-    ) -> Result<Self, Avm2Error> {
+    ) -> Result<Self, Avm2Error<'gc>> {
         Ok(SoundTransform {
             left_to_left: (as3_st
-                .get_property(
-                    &Avm2QName::new(Avm2Namespace::public(), "leftToLeft").into(),
-                    activation,
-                )?
+                .get_property(&Avm2Multiname::public("leftToLeft"), activation)?
                 .coerce_to_number(activation)?
                 * 100.0) as i32,
             left_to_right: (as3_st
-                .get_property(
-                    &Avm2QName::new(Avm2Namespace::public(), "leftToRight").into(),
-                    activation,
-                )?
+                .get_property(&Avm2Multiname::public("leftToRight"), activation)?
                 .coerce_to_number(activation)?
                 * 100.0) as i32,
             right_to_left: (as3_st
-                .get_property(
-                    &Avm2QName::new(Avm2Namespace::public(), "rightToLeft").into(),
-                    activation,
-                )?
+                .get_property(&Avm2Multiname::public("rightToLeft"), activation)?
                 .coerce_to_number(activation)?
                 * 100.0) as i32,
             right_to_right: (as3_st
-                .get_property(
-                    &Avm2QName::new(Avm2Namespace::public(), "rightToRight").into(),
-                    activation,
-                )?
+                .get_property(&Avm2Multiname::public("rightToRight"), activation)?
                 .coerce_to_number(activation)?
                 * 100.0) as i32,
             volume: (as3_st
-                .get_property(
-                    &Avm2QName::new(Avm2Namespace::public(), "volume").into(),
-                    activation,
-                )?
+                .get_property(&Avm2Multiname::public("volume"), activation)?
                 .coerce_to_number(activation)?
                 * 100.0) as i32,
         })
@@ -1677,7 +1785,7 @@ impl SoundTransform {
     pub fn into_avm2_object<'gc>(
         self,
         activation: &mut Avm2Activation<'_, 'gc, '_>,
-    ) -> Result<Avm2Object<'gc>, Avm2Error> {
+    ) -> Result<Avm2Object<'gc>, Avm2Error<'gc>> {
         let mut as3_st = activation
             .avm2()
             .classes()
@@ -1685,27 +1793,27 @@ impl SoundTransform {
             .construct(activation, &[])?;
 
         as3_st.set_property(
-            &Avm2QName::new(Avm2Namespace::public(), "leftToLeft").into(),
+            &Avm2Multiname::public("leftToLeft"),
             (self.left_to_left as f64 / 100.0).into(),
             activation,
         )?;
         as3_st.set_property(
-            &Avm2QName::new(Avm2Namespace::public(), "leftToRight").into(),
+            &Avm2Multiname::public("leftToRight"),
             (self.left_to_right as f64 / 100.0).into(),
             activation,
         )?;
         as3_st.set_property(
-            &Avm2QName::new(Avm2Namespace::public(), "rightToLeft").into(),
+            &Avm2Multiname::public("rightToLeft"),
             (self.right_to_left as f64 / 100.0).into(),
             activation,
         )?;
         as3_st.set_property(
-            &Avm2QName::new(Avm2Namespace::public(), "rightToRight").into(),
+            &Avm2Multiname::public("rightToRight"),
             (self.right_to_right as f64 / 100.0).into(),
             activation,
         )?;
         as3_st.set_property(
-            &Avm2QName::new(Avm2Namespace::public(), "volume").into(),
+            &Avm2Multiname::public("volume"),
             (self.volume as f64 / 100.0).into(),
             activation,
         )?;

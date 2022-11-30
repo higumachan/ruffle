@@ -1,14 +1,16 @@
-use crate::avm1::property_map::PropertyMap as Avm1PropertyMap;
+use crate::avm1::PropertyMap as Avm1PropertyMap;
 use crate::avm2::{ClassObject as Avm2ClassObject, Domain as Avm2Domain};
-use crate::backend::{audio::SoundHandle, render};
+use crate::backend::audio::SoundHandle;
 use crate::character::Character;
 use crate::display_object::{Bitmap, Graphic, MorphShape, TDisplayObject, Text};
 use crate::font::{Font, FontDescriptor};
 use crate::prelude::*;
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
-use crate::vminterface::AvmType;
 use gc_arena::{Collect, MutationContext};
+use ruffle_render::backend::RenderBackend;
+use ruffle_render::bitmap::BitmapHandle;
+use ruffle_render::utils::remove_invalid_jpeg_data;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use swf::CharacterId;
@@ -99,18 +101,16 @@ pub struct MovieLibrary<'gc> {
     export_characters: Avm1PropertyMap<'gc, Character<'gc>>,
     jpeg_tables: Option<Vec<u8>>,
     fonts: HashMap<FontDescriptor, Font<'gc>>,
-    avm_type: AvmType,
     avm2_domain: Option<Avm2Domain<'gc>>,
 }
 
 impl<'gc> MovieLibrary<'gc> {
-    pub fn new(avm_type: AvmType) -> Self {
+    pub fn new() -> Self {
         Self {
             characters: HashMap::new(),
             export_characters: Avm1PropertyMap::new(),
             jpeg_tables: None,
             fonts: HashMap::new(),
-            avm_type,
             avm2_domain: None,
         }
     }
@@ -167,12 +167,12 @@ impl<'gc> MovieLibrary<'gc> {
         &self,
         id: CharacterId,
         gc_context: MutationContext<'gc, '_>,
-    ) -> Result<DisplayObject<'gc>, Box<dyn std::error::Error>> {
+    ) -> Result<DisplayObject<'gc>, &'static str> {
         if let Some(character) = self.characters.get(&id) {
             self.instantiate_display_object(character, gc_context)
         } else {
             log::error!("Tried to instantiate non-registered character ID {}", id);
-            Err("Character id doesn't exist".into())
+            Err("Character id doesn't exist")
         }
     }
 
@@ -182,7 +182,7 @@ impl<'gc> MovieLibrary<'gc> {
         &self,
         export_name: AvmString<'gc>,
         gc_context: MutationContext<'gc, '_>,
-    ) -> Result<DisplayObject<'gc>, Box<dyn std::error::Error>> {
+    ) -> Result<DisplayObject<'gc>, &'static str> {
         if let Some(character) = self.export_characters.get(export_name, false) {
             self.instantiate_display_object(character, gc_context)
         } else {
@@ -190,7 +190,7 @@ impl<'gc> MovieLibrary<'gc> {
                 "Tried to instantiate non-registered character {}",
                 export_name
             );
-            Err("Character id doesn't exist".into())
+            Err("Character id doesn't exist")
         }
     }
 
@@ -200,9 +200,12 @@ impl<'gc> MovieLibrary<'gc> {
         &self,
         character: &Character<'gc>,
         gc_context: MutationContext<'gc, '_>,
-    ) -> Result<DisplayObject<'gc>, Box<dyn std::error::Error>> {
+    ) -> Result<DisplayObject<'gc>, &'static str> {
         match character {
-            Character::Bitmap(bitmap) => Ok(bitmap.instantiate(gc_context)),
+            Character::Bitmap {
+                bitmap,
+                initial_data: _,
+            } => Ok(bitmap.instantiate(gc_context)),
             Character::EditText(edit_text) => Ok(edit_text.instantiate(gc_context)),
             Character::Graphic(graphic) => Ok(graphic.instantiate(gc_context)),
             Character::MorphShape(morph_shape) => Ok(morph_shape.instantiate(gc_context)),
@@ -211,12 +214,12 @@ impl<'gc> MovieLibrary<'gc> {
             Character::Avm2Button(button) => Ok(button.instantiate(gc_context)),
             Character::Text(text) => Ok(text.instantiate(gc_context)),
             Character::Video(video) => Ok(video.instantiate(gc_context)),
-            _ => Err("Not a DisplayObject".into()),
+            _ => Err("Not a DisplayObject"),
         }
     }
 
     pub fn get_bitmap(&self, id: CharacterId) -> Option<Bitmap<'gc>> {
-        if let Some(&Character::Bitmap(bitmap)) = self.characters.get(&id) {
+        if let Some(&Character::Bitmap { bitmap, .. }) = self.characters.get(&id) {
             Some(bitmap)
         } else {
             None
@@ -281,7 +284,7 @@ impl<'gc> MovieLibrary<'gc> {
         }
     }
 
-    pub fn set_jpeg_tables(&mut self, data: Vec<u8>) {
+    pub fn set_jpeg_tables(&mut self, data: &[u8]) {
         if self.jpeg_tables.is_some() {
             // SWF spec says there should only be one JPEGTables tag.
             // TODO: What is the behavior when there are multiples?
@@ -293,26 +296,12 @@ impl<'gc> MovieLibrary<'gc> {
         self.jpeg_tables = if data.is_empty() {
             None
         } else {
-            Some(render::remove_invalid_jpeg_data(&data[..]).to_vec())
+            Some(remove_invalid_jpeg_data(data).to_vec())
         }
     }
 
     pub fn jpeg_tables(&self) -> Option<&[u8]> {
         self.jpeg_tables.as_ref().map(|data| &data[..])
-    }
-
-    /// Get the VM type of this movie.
-    pub fn avm_type(&self) -> AvmType {
-        self.avm_type
-    }
-
-    /// Forcibly set the AVM type of this movie.
-    ///
-    /// This is intended for display object types which can be created
-    /// dynamically but need a placeholder movie. You should *not* attempt to
-    /// change the AVM type of an actual SWF.
-    pub fn force_avm_type(&mut self, new_type: AvmType) {
-        self.avm_type = new_type;
     }
 
     pub fn set_avm2_domain(&mut self, avm2_domain: Avm2Domain<'gc>) {
@@ -330,15 +319,23 @@ impl<'gc> MovieLibrary<'gc> {
     }
 }
 
-impl<'gc> render::BitmapSource for MovieLibrary<'gc> {
-    fn bitmap(&self, id: u16) -> Option<render::BitmapInfo> {
-        self.get_bitmap(id).and_then(|bitmap| {
-            Some(render::BitmapInfo {
-                handle: bitmap.bitmap_handle()?,
+impl<'gc> ruffle_render::bitmap::BitmapSource for MovieLibrary<'gc> {
+    fn bitmap_size(&self, id: u16) -> Option<ruffle_render::bitmap::BitmapSize> {
+        self.get_bitmap(id)
+            .map(|bitmap| ruffle_render::bitmap::BitmapSize {
                 width: bitmap.width(),
                 height: bitmap.height(),
             })
-        })
+    }
+    fn bitmap_handle(&self, id: u16, _backend: &mut dyn RenderBackend) -> Option<BitmapHandle> {
+        self.get_bitmap(id)
+            .and_then(|bitmap| bitmap.bitmap_handle())
+    }
+}
+
+impl Default for MovieLibrary<'_> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -380,10 +377,9 @@ impl<'gc> Library<'gc> {
     }
 
     pub fn library_for_movie_mut(&mut self, movie: Arc<SwfMovie>) -> &mut MovieLibrary<'gc> {
-        let avm_type = movie.avm_type();
         self.movie_libraries
             .entry(movie)
-            .or_insert_with(|| MovieLibrary::new(avm_type))
+            .or_insert_with(MovieLibrary::new)
     }
 
     /// Returns the device font for use when a font is unavailable.
@@ -392,8 +388,8 @@ impl<'gc> Library<'gc> {
     }
 
     /// Sets the device font.
-    pub fn set_device_font(&mut self, font: Option<Font<'gc>>) {
-        self.device_font = font;
+    pub fn set_device_font(&mut self, font: Font<'gc>) {
+        self.device_font = Some(font);
     }
 
     /// Get the AVM2 class registry.

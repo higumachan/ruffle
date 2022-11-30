@@ -1,16 +1,19 @@
 //! Interactive object enumtrait
 
-use crate::avm2::{Avm2, Event as Avm2Event, EventData as Avm2EventData, Value as Avm2Value};
+use crate::avm2::activation::Activation as Avm2Activation;
+use crate::avm2::{Avm2, EventObject as Avm2EventObject, Value as Avm2Value};
 use crate::backend::ui::MouseCursor;
 use crate::context::UpdateContext;
 use crate::display_object::avm1_button::Avm1Button;
 use crate::display_object::avm2_button::Avm2Button;
 use crate::display_object::edit_text::EditText;
+use crate::display_object::loader_display::LoaderDisplay;
 use crate::display_object::movie_clip::MovieClip;
 use crate::display_object::stage::Stage;
 use crate::display_object::{
     DisplayObject, DisplayObjectBase, TDisplayObject, TDisplayObjectContainer,
 };
+use crate::duration::Duration;
 use crate::events::{ClipEvent, ClipEventResult};
 use bitflags::bitflags;
 use gc_arena::{Collect, MutationContext};
@@ -18,7 +21,6 @@ use instant::Instant;
 use ruffle_macros::enum_trait_object;
 use std::cell::{Ref, RefMut};
 use std::fmt::Debug;
-use std::time::Duration;
 use swf::Twips;
 
 /// Find the lowest common ancestor between the display objects in `from` and
@@ -108,51 +110,55 @@ impl<'gc> Default for InteractiveObjectBase<'gc> {
         Avm2Button(Avm2Button<'gc>),
         MovieClip(MovieClip<'gc>),
         EditText(EditText<'gc>),
+        LoaderDisplay(LoaderDisplay<'gc>),
     }
 )]
 pub trait TInteractiveObject<'gc>:
     'gc + Clone + Copy + Collect + Debug + Into<InteractiveObject<'gc>>
 {
-    fn ibase(&self) -> Ref<InteractiveObjectBase<'gc>>;
+    fn raw_interactive(&self) -> Ref<InteractiveObjectBase<'gc>>;
 
-    fn ibase_mut(&self, mc: MutationContext<'gc, '_>) -> RefMut<InteractiveObjectBase<'gc>>;
+    fn raw_interactive_mut(
+        &self,
+        mc: MutationContext<'gc, '_>,
+    ) -> RefMut<InteractiveObjectBase<'gc>>;
 
     fn as_displayobject(self) -> DisplayObject<'gc>;
 
     /// Check if the interactive object accepts user input.
     fn mouse_enabled(self) -> bool {
-        self.ibase()
+        self.raw_interactive()
             .flags
             .contains(InteractiveObjectFlags::MOUSE_ENABLED)
     }
 
     /// Set if the interactive object accepts user input.
     fn set_mouse_enabled(self, mc: MutationContext<'gc, '_>, value: bool) {
-        self.ibase_mut(mc)
+        self.raw_interactive_mut(mc)
             .flags
             .set(InteractiveObjectFlags::MOUSE_ENABLED, value)
     }
 
     /// Check if the interactive object accepts double-click events.
     fn double_click_enabled(self) -> bool {
-        self.ibase()
+        self.raw_interactive()
             .flags
             .contains(InteractiveObjectFlags::DOUBLE_CLICK_ENABLED)
     }
 
     // Set if the interactive object accepts double-click events.
     fn set_double_click_enabled(self, mc: MutationContext<'gc, '_>, value: bool) {
-        self.ibase_mut(mc)
+        self.raw_interactive_mut(mc)
             .flags
             .set(InteractiveObjectFlags::DOUBLE_CLICK_ENABLED, value)
     }
 
     fn context_menu(self) -> Avm2Value<'gc> {
-        self.ibase().context_menu
+        self.raw_interactive().context_menu
     }
 
     fn set_context_menu(self, mc: MutationContext<'gc, '_>, value: Avm2Value<'gc>) {
-        self.ibase_mut(mc).context_menu = value;
+        self.raw_interactive_mut(mc).context_menu = value;
     }
 
     /// Filter the incoming clip event.
@@ -217,37 +223,41 @@ pub trait TInteractiveObject<'gc>:
             return ClipEventResult::NotHandled;
         };
 
+        let mut activation = Avm2Activation::from_nothing(context.reborrow());
+
         match event {
             ClipEvent::Press => {
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "mouseDown",
-                    Avm2EventData::mouse_event(context, self.as_displayobject(), None, 0),
+                    self.as_displayobject(),
+                    None,
+                    0,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 
                 ClipEventResult::Handled
             }
             ClipEvent::MouseUpInside => {
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "mouseUp",
-                    Avm2EventData::mouse_event(context, self.as_displayobject(), None, 0),
+                    self.as_displayobject(),
+                    None,
+                    0,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 
                 ClipEventResult::Handled
             }
             ClipEvent::Release => {
-                let read = self.ibase();
+                let read = self.raw_interactive();
                 let last_click = read.last_click;
                 let this_click = Instant::now();
 
@@ -255,73 +265,81 @@ pub trait TInteractiveObject<'gc>:
                     .flags
                     .contains(InteractiveObjectFlags::DOUBLE_CLICK_ENABLED)
                     && last_click
-                        .map(|lc| this_click - lc < Duration::from_secs(1))
+                        .map(|lc| Duration::from(this_click - lc) < Duration::from_secs(1.0))
                         .unwrap_or(false);
 
                 drop(read);
 
                 if is_double_click {
-                    let mut avm2_event = Avm2Event::new(
+                    let avm2_event = Avm2EventObject::mouse_event(
+                        &mut activation,
                         "doubleClick",
-                        Avm2EventData::mouse_event(context, self.as_displayobject(), None, 0),
+                        self.as_displayobject(),
+                        None,
+                        0,
                     );
 
-                    avm2_event.set_bubbles(true);
-
-                    if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                    if let Err(e) =
+                        Avm2::dispatch_event(&mut activation.context, avm2_event, target)
+                    {
                         log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                     }
 
-                    self.ibase_mut(context.gc_context).last_click = None;
+                    self.raw_interactive_mut(context.gc_context).last_click = None;
                 } else {
-                    let mut avm2_event = Avm2Event::new(
+                    let avm2_event = Avm2EventObject::mouse_event(
+                        &mut activation,
                         "click",
-                        Avm2EventData::mouse_event(context, self.as_displayobject(), None, 0),
+                        self.as_displayobject(),
+                        None,
+                        0,
                     );
 
-                    avm2_event.set_bubbles(true);
-
-                    if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                    if let Err(e) =
+                        Avm2::dispatch_event(&mut activation.context, avm2_event, target)
+                    {
                         log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                     }
 
-                    self.ibase_mut(context.gc_context).last_click = Some(this_click);
+                    self.raw_interactive_mut(context.gc_context).last_click = Some(this_click);
                 }
 
                 ClipEventResult::Handled
             }
             ClipEvent::ReleaseOutside => {
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "releaseOutside",
-                    Avm2EventData::mouse_event(context, self.as_displayobject(), None, 0),
+                    self.as_displayobject(),
+                    None,
+                    0,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 
-                self.ibase_mut(context.gc_context).last_click = None;
+                self.raw_interactive_mut(context.gc_context).last_click = None;
 
                 ClipEventResult::Handled
             }
             ClipEvent::RollOut { to } | ClipEvent::DragOut { to } => {
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "mouseOut",
-                    Avm2EventData::mouse_event(context, self.as_displayobject(), to, 0),
+                    self.as_displayobject(),
+                    to,
+                    0,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 
                 let lca = lowest_common_ancestor(
                     self.as_displayobject(),
                     to.map(|t| t.as_displayobject())
-                        .unwrap_or_else(|| context.stage.into()),
+                        .unwrap_or_else(|| activation.context.stage.into()),
                 );
 
                 let mut rollover_target = Some(self.as_displayobject());
@@ -331,10 +349,12 @@ pub trait TInteractiveObject<'gc>:
                     }
 
                     let avm2_event =
-                        Avm2Event::new("rollOut", Avm2EventData::mouse_event(context, tgt, to, 0));
+                        Avm2EventObject::mouse_event(&mut activation, "rollOut", tgt, to, 0);
 
                     if let Avm2Value::Object(avm2_target) = tgt.object2() {
-                        if let Err(e) = Avm2::dispatch_event(context, avm2_event, avm2_target) {
+                        if let Err(e) =
+                            Avm2::dispatch_event(&mut activation.context, avm2_event, avm2_target)
+                        {
                             log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                         }
                     }
@@ -342,7 +362,7 @@ pub trait TInteractiveObject<'gc>:
                     rollover_target = tgt.parent();
                 }
 
-                self.ibase_mut(context.gc_context).last_click = None;
+                self.raw_interactive_mut(context.gc_context).last_click = None;
 
                 ClipEventResult::Handled
             }
@@ -350,7 +370,7 @@ pub trait TInteractiveObject<'gc>:
                 let lca = lowest_common_ancestor(
                     self.as_displayobject(),
                     from.map(|t| t.as_displayobject())
-                        .unwrap_or_else(|| context.stage.into()),
+                        .unwrap_or_else(|| activation.context.stage.into()),
                 );
 
                 let mut rollover_target = Some(self.as_displayobject());
@@ -359,13 +379,13 @@ pub trait TInteractiveObject<'gc>:
                         break;
                     }
 
-                    let avm2_event = Avm2Event::new(
-                        "rollOver",
-                        Avm2EventData::mouse_event(context, tgt, from, 0),
-                    );
+                    let avm2_event =
+                        Avm2EventObject::mouse_event(&mut activation, "mouseOut", tgt, from, 0);
 
                     if let Avm2Value::Object(avm2_target) = tgt.object2() {
-                        if let Err(e) = Avm2::dispatch_event(context, avm2_event, avm2_target) {
+                        if let Err(e) =
+                            Avm2::dispatch_event(&mut activation.context, avm2_event, avm2_target)
+                        {
                             log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                         }
                     }
@@ -373,47 +393,45 @@ pub trait TInteractiveObject<'gc>:
                     rollover_target = tgt.parent();
                 }
 
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "mouseOver",
-                    Avm2EventData::mouse_event(context, self.as_displayobject(), from, 0),
+                    self.as_displayobject(),
+                    from,
+                    0,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 
                 ClipEventResult::Handled
             }
             ClipEvent::MouseWheel { delta } => {
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "mouseWheel",
-                    Avm2EventData::mouse_event(
-                        context,
-                        self.as_displayobject(),
-                        None,
-                        delta.lines() as i32,
-                    ),
+                    self.as_displayobject(),
+                    None,
+                    delta.lines() as i32,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 
                 ClipEventResult::Handled
             }
             ClipEvent::MouseMoveInside => {
-                let mut avm2_event = Avm2Event::new(
+                let avm2_event = Avm2EventObject::mouse_event(
+                    &mut activation,
                     "mouseMove",
-                    Avm2EventData::mouse_event(context, self.as_displayobject(), None, 0),
+                    self.as_displayobject(),
+                    None,
+                    0,
                 );
 
-                avm2_event.set_bubbles(true);
-
-                if let Err(e) = Avm2::dispatch_event(context, avm2_event, target) {
+                if let Err(e) = Avm2::dispatch_event(&mut activation.context, avm2_event, target) {
                     log::error!("Got error when dispatching {:?} to AVM2: {}", event, e);
                 }
 

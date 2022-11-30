@@ -1,11 +1,11 @@
 //! Boxed QNames
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::QName;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::QName;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
 
@@ -13,7 +13,7 @@ use std::cell::{Ref, RefMut};
 pub fn qname_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
+) -> Result<Object<'gc>, Error<'gc>> {
     let base = ScriptObjectData::new(class);
 
     Ok(QNameObject(GcCell::allocate(
@@ -43,7 +43,7 @@ impl<'gc> QNameObject<'gc> {
     pub fn from_qname(
         activation: &mut Activation<'_, 'gc, '_>,
         qname: QName<'gc>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().qname;
         let base = ScriptObjectData::new(class);
 
@@ -87,7 +87,7 @@ impl<'gc> TObject<'gc> for QNameObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
     }
 

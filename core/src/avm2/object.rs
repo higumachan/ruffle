@@ -7,13 +7,15 @@ use crate::avm2::class::Class;
 use crate::avm2::domain::Domain;
 use crate::avm2::events::{DispatchList, Event};
 use crate::avm2::function::Executable;
-use crate::avm2::names::{Multiname, Namespace, QName};
 use crate::avm2::property::Property;
 use crate::avm2::regexp::RegExp;
 use crate::avm2::value::{Hint, Value};
 use crate::avm2::vector::VectorStorage;
 use crate::avm2::vtable::{ClassBoundMethod, VTable};
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use crate::backend::audio::{SoundHandle, SoundInstanceHandle};
 use crate::bitmap::bitmap_data::BitmapData;
 use crate::display_object::DisplayObject;
@@ -29,50 +31,62 @@ mod array_object;
 mod bitmapdata_object;
 mod bytearray_object;
 mod class_object;
+mod context3d_object;
 mod date_object;
 mod dictionary_object;
 mod dispatch_object;
 mod domain_object;
+mod error_object;
 mod event_object;
 mod function_object;
+mod index_buffer_3d_object;
 mod loaderinfo_object;
 mod namespace_object;
 mod primitive_object;
+mod program_3d_object;
 mod proxy_object;
 mod qname_object;
 mod regexp_object;
 mod script_object;
 mod sound_object;
 mod soundchannel_object;
+mod stage3d_object;
 mod stage_object;
 mod textformat_object;
 mod vector_object;
+mod vertex_buffer_3d_object;
 mod xml_object;
 
 pub use crate::avm2::object::array_object::{array_allocator, ArrayObject};
 pub use crate::avm2::object::bitmapdata_object::{bitmapdata_allocator, BitmapDataObject};
-pub use crate::avm2::object::bytearray_object::{bytearray_allocator, ByteArrayObject};
+pub use crate::avm2::object::bytearray_object::{byte_array_allocator, ByteArrayObject};
 pub use crate::avm2::object::class_object::ClassObject;
+pub use crate::avm2::object::context3d_object::Context3DObject;
 pub use crate::avm2::object::date_object::{date_allocator, DateObject};
 pub use crate::avm2::object::dictionary_object::{dictionary_allocator, DictionaryObject};
 pub use crate::avm2::object::dispatch_object::DispatchObject;
 pub use crate::avm2::object::domain_object::{appdomain_allocator, DomainObject};
+pub use crate::avm2::object::error_object::{error_allocator, ErrorObject};
 pub use crate::avm2::object::event_object::{event_allocator, EventObject};
-pub use crate::avm2::object::function_object::FunctionObject;
+pub use crate::avm2::object::function_object::{function_allocator, FunctionObject};
+pub use crate::avm2::object::index_buffer_3d_object::IndexBuffer3DObject;
 pub use crate::avm2::object::loaderinfo_object::{
     loaderinfo_allocator, LoaderInfoObject, LoaderStream,
 };
 pub use crate::avm2::object::namespace_object::{namespace_allocator, NamespaceObject};
 pub use crate::avm2::object::primitive_object::{primitive_allocator, PrimitiveObject};
+pub use crate::avm2::object::program_3d_object::Program3DObject;
 pub use crate::avm2::object::proxy_object::{proxy_allocator, ProxyObject};
 pub use crate::avm2::object::qname_object::{qname_allocator, QNameObject};
 pub use crate::avm2::object::regexp_object::{regexp_allocator, RegExpObject};
 pub use crate::avm2::object::script_object::{ScriptObject, ScriptObjectData};
 pub use crate::avm2::object::sound_object::{sound_allocator, SoundObject};
 pub use crate::avm2::object::soundchannel_object::{soundchannel_allocator, SoundChannelObject};
+pub use crate::avm2::object::stage3d_object::{stage_3d_allocator, Stage3DObject};
 pub use crate::avm2::object::stage_object::{stage_allocator, StageObject};
 pub use crate::avm2::object::textformat_object::{textformat_allocator, TextFormatObject};
 pub use crate::avm2::object::vector_object::{vector_allocator, VectorObject};
+pub use crate::avm2::object::vertex_buffer_3d_object::VertexBuffer3DObject;
 pub use crate::avm2::object::xml_object::{xml_allocator, XmlObject};
 
 /// Represents an object that can be directly interacted with by the AVM2
@@ -105,6 +119,12 @@ pub use crate::avm2::object::xml_object::{xml_allocator, XmlObject};
         QNameObject(QNameObject<'gc>),
         TextFormatObject(TextFormatObject<'gc>),
         ProxyObject(ProxyObject<'gc>),
+        ErrorObject(ErrorObject<'gc>),
+        Stage3DObject(Stage3DObject<'gc>),
+        Context3DObject(Context3DObject<'gc>),
+        IndexBuffer3DObject(IndexBuffer3DObject<'gc>),
+        VertexBuffer3DObject(VertexBuffer3DObject<'gc>),
+        Program3DObject(Program3DObject<'gc>),
     }
 )]
 pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy {
@@ -123,7 +143,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         name: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         self.base().get_property_local(name, activation)
     }
 
@@ -139,10 +159,11 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         mut self,
         multiname: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         match self.vtable().and_then(|vtable| vtable.get_trait(multiname)) {
-            Some(Property::Slot { slot_id, class: _ })
-            | Some(Property::ConstSlot { slot_id, class: _ }) => self.base().get_slot(slot_id),
+            Some(Property::Slot { slot_id }) | Some(Property::ConstSlot { slot_id }) => {
+                self.base().get_slot(slot_id)
+            }
             Some(Property::Method { disp_id }) => {
                 if let Some(bound_method) = self.get_bound_method(disp_id) {
                     return Ok(bound_method.into());
@@ -177,7 +198,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         name: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut base = self.base_mut(activation.context.gc_context);
         base.set_property_local(name, value, activation)
     }
@@ -194,10 +215,13 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         multiname: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         match self.vtable().and_then(|vtable| vtable.get_trait(multiname)) {
-            Some(Property::Slot { slot_id, mut class }) => {
-                let value = class.coerce(activation, value)?;
+            Some(Property::Slot { slot_id }) => {
+                let value = self
+                    .vtable()
+                    .unwrap()
+                    .coerce_trait_value(slot_id, value, activation)?;
                 self.base_mut(activation.context.gc_context).set_slot(
                     slot_id,
                     value,
@@ -229,7 +253,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         name: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut base = self.base_mut(activation.context.gc_context);
         base.init_property_local(name, value, activation)
     }
@@ -244,11 +268,13 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         multiname: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         match self.vtable().and_then(|vtable| vtable.get_trait(multiname)) {
-            Some(Property::Slot { slot_id, mut class })
-            | Some(Property::ConstSlot { slot_id, mut class }) => {
-                let value = class.coerce(activation, value)?;
+            Some(Property::Slot { slot_id }) | Some(Property::ConstSlot { slot_id }) => {
+                let value = self
+                    .vtable()
+                    .unwrap()
+                    .coerce_trait_value(slot_id, value, activation)?;
                 self.base_mut(activation.context.gc_context).set_slot(
                     slot_id,
                     value,
@@ -277,7 +303,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         multiname: &Multiname<'gc>,
         arguments: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         // Note: normally this would just call into ScriptObjectData::call_property_local
         // but because calling into ScriptObjectData borrows it for entire duration,
         // we run a risk of a double borrow if the inner call borrows again.
@@ -300,10 +326,9 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         multiname: &Multiname<'gc>,
         arguments: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         match self.vtable().and_then(|vtable| vtable.get_trait(multiname)) {
-            Some(Property::Slot { slot_id, class: _ })
-            | Some(Property::ConstSlot { slot_id, class: _ }) => {
+            Some(Property::Slot { slot_id }) | Some(Property::ConstSlot { slot_id }) => {
                 let obj = self.base().get_slot(slot_id)?.as_callable(
                     activation,
                     Some(multiname),
@@ -362,7 +387,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     }
 
     /// Retrieve a slot by its index.
-    fn get_slot(self, id: u32) -> Result<Value<'gc>, Error> {
+    fn get_slot(self, id: u32) -> Result<Value<'gc>, Error<'gc>> {
         let base = self.base();
 
         base.get_slot(id)
@@ -374,7 +399,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         id: u32,
         value: Value<'gc>,
         mc: MutationContext<'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut base = self.base_mut(mc);
 
         base.set_slot(id, value, mc)
@@ -386,7 +411,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         id: u32,
         value: Value<'gc>,
         mc: MutationContext<'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut base = self.base_mut(mc);
 
         base.init_slot(id, value, mc)
@@ -401,7 +426,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         id: u32,
         arguments: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         if self.get_bound_method(id).is_none() {
             if let Some(vtable) = self.vtable() {
                 if let Some(bound_method) = vtable.make_bound_method(activation, self.into(), id) {
@@ -415,7 +440,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
             return method_object.call(Some(self.into()), arguments, activation);
         }
 
-        Err(format!("Cannot call unknown method id {}", id).into())
+        Err(format!("Cannot call unknown method id {id}").into())
     }
 
     /// Implements the `in` opcode and AS3 operator.
@@ -426,7 +451,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         _activation: &mut Activation<'_, 'gc, '_>,
         name: &Multiname<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         Ok(self.has_property(name))
     }
 
@@ -462,7 +487,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         activation: &mut Activation<'_, 'gc, '_>,
         name: &Multiname<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         let mut base = self.base_mut(activation.context.gc_context);
 
         Ok(base.delete_property_local(name))
@@ -475,7 +500,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
         multiname: &Multiname<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         match self.vtable().and_then(|vtable| vtable.get_trait(multiname)) {
             None => {
                 if self
@@ -529,7 +554,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         last_index: u32,
         _activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Option<u32>, Error> {
+    ) -> Result<Option<u32>, Error<'gc>> {
         let base = self.base();
 
         Ok(base.get_next_enumerant(last_index))
@@ -545,7 +570,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         index: u32,
         _activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let base = self.base();
 
         Ok(base.get_enumerant_name(index).unwrap_or(Value::Undefined))
@@ -559,11 +584,11 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         index: u32,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let name = self
             .get_enumerant_name(index, activation)?
             .coerce_to_string(activation)?;
-        self.get_property(&QName::dynamic_name(name).into(), activation)
+        self.get_property(&Multiname::public(name), activation)
     }
 
     /// Determine if a property is currently enumerable.
@@ -581,7 +606,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         mc: MutationContext<'gc, '_>,
         name: AvmString<'gc>,
         is_enumerable: bool,
-    ) -> Result<(), Error> {
+    ) {
         let mut base = self.base_mut(mc);
 
         base.set_local_property_is_enumerable(name, is_enumerable)
@@ -627,7 +652,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         _reciever: Option<Object<'gc>>,
         _arguments: &[Value<'gc>],
         _activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         Err("Object is not callable".into())
     }
 
@@ -651,7 +676,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         self,
         _activation: &mut Activation<'_, 'gc, '_>,
         _args: &[Value<'gc>],
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         Err("Object is not constructable".into())
     }
 
@@ -663,7 +688,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         multiname: &Multiname<'gc>,
         args: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let ctor = self.get_property(multiname, activation)?.as_callable(
             activation,
             Some(multiname),
@@ -692,7 +717,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         &self,
         _activation: &mut Activation<'_, 'gc, '_>,
         _params: &[Value<'gc>],
-    ) -> Result<ClassObject<'gc>, Error> {
+    ) -> Result<ClassObject<'gc>, Error<'gc>> {
         Err("Not a parameterized type".into())
     }
 
@@ -714,13 +739,20 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     /// coercions happen by defining `toString` in a downstream class or
     /// prototype; this is then picked up by the VM runtime when doing
     /// coercions.
-    fn to_string(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_string(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let class_name = self
             .instance_of_class_definition()
             .map(|c| c.read().name().local_name())
             .unwrap_or_else(|| "Object".into());
 
-        Ok(AvmString::new_utf8(mc, format!("[object {}]", class_name)).into())
+        Ok(AvmString::new_utf8(
+            activation.context.gc_context,
+            format!("[object {class_name}]"),
+        )
+        .into())
     }
 
     /// Implement the result of calling `Object.prototype.toLocaleString` on this
@@ -731,13 +763,20 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     /// generate a debug-style string based on the name of the class this
     /// object is, in the format of `[object Class]` (where `Class` is the name
     /// of the class that created this object).
-    fn to_locale_string(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_locale_string(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let class_name = self
             .instance_of_class_definition()
             .map(|c| c.read().name().local_name())
             .unwrap_or_else(|| "Object".into());
 
-        Ok(AvmString::new_utf8(mc, format!("[object {}]", class_name)).into())
+        Ok(AvmString::new_utf8(
+            activation.context.gc_context,
+            format!("[object {class_name}]"),
+        )
+        .into())
     }
 
     /// Implement the result of calling `Object.prototype.valueOf` on this
@@ -745,7 +784,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     ///
     /// `valueOf` is a method used to request an object be coerced to a
     /// primitive value. Typically, this would be a number of some kind.
-    fn value_of(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error>;
+    fn value_of(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>>;
 
     /// Determine if this object is an instance of a given type.
     ///
@@ -760,9 +799,9 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
         class: Object<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         let type_proto = class
-            .get_property(&QName::dynamic_name("prototype").into(), activation)?
+            .get_property(&Multiname::public("prototype"), activation)?
             .as_object();
 
         if let Some(type_proto) = type_proto {
@@ -776,7 +815,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     ///
     /// The given object `type_proto` should be the prototype we are checking
     /// against this object.
-    fn has_prototype_in_chain(&self, type_proto: Object<'gc>) -> Result<bool, Error> {
+    fn has_prototype_in_chain(&self, type_proto: Object<'gc>) -> Result<bool, Error<'gc>> {
         let mut my_proto = self.proto();
 
         //TODO: Is it a verification error to do `obj instanceof bare_object`?
@@ -803,17 +842,17 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         &self,
         test_class: ClassObject<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<bool, Error> {
+    ) -> bool {
         let my_class = self.instance_of();
 
         // ES3 objects are not class instances but are still treated as
         // instances of Object, which is an ES4 class.
         if my_class.is_none() && Object::ptr_eq(test_class, activation.avm2().classes().object) {
-            Ok(true)
+            true
         } else if let Some(my_class) = my_class {
-            my_class.has_class_in_chain(test_class, activation)
+            my_class.has_class_in_chain(test_class)
         } else {
-            Ok(false)
+            false
         }
     }
 
@@ -892,6 +931,10 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
     /// Unwrap this object as a `QNameObject`
     fn as_qname_object(self) -> Option<QNameObject<'gc>> {
+        None
+    }
+
+    fn as_loader_info_object(&self) -> Option<&LoaderInfoObject<'gc>> {
         None
     }
 
@@ -1003,11 +1046,6 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         None
     }
 
-    /// Unwrap this object's loader stream
-    fn as_loader_stream(&self) -> Option<Ref<LoaderStream<'gc>>> {
-        None
-    }
-
     /// Unwrap this object's sound handle.
     fn as_sound(self) -> Option<SoundHandle> {
         None
@@ -1063,6 +1101,35 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
     /// Unwrap this object as a mutable text format.
     fn as_text_format_mut(&self, _mc: MutationContext<'gc, '_>) -> Option<RefMut<TextFormat>> {
+        None
+    }
+
+    /// Unwrap this object as an Error.
+    fn as_error_object(&self) -> Option<ErrorObject<'gc>> {
+        None
+    }
+
+    fn as_xml(&self) -> Option<XmlObject<'gc>> {
+        None
+    }
+
+    fn as_context_3d(&self) -> Option<Context3DObject<'gc>> {
+        None
+    }
+
+    fn as_index_buffer(&self) -> Option<IndexBuffer3DObject<'gc>> {
+        None
+    }
+
+    fn as_vertex_buffer(&self) -> Option<VertexBuffer3DObject<'gc>> {
+        None
+    }
+
+    fn as_program_3d(&self) -> Option<Program3DObject<'gc>> {
+        None
+    }
+
+    fn as_stage_3d(&self) -> Option<Stage3DObject<'gc>> {
         None
     }
 }
